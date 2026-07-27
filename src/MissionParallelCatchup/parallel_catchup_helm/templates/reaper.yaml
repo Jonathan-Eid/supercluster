@@ -1,0 +1,92 @@
+{{- if .Values.reaper.enabled }}
+{{- if not .Values.worker.dataStorageClass }}
+{{- fail "reaper.enabled requires worker.dataStorageClass: the reaper works by replacing a worker's PVC with one that can never bind, which does nothing if /data is an emptyDir" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-reaper-script
+data:
+  reaper.py: |-
+{{ .Files.Get "files/reaper.py" | indent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-reaper
+spec:
+  replicas: 1
+  # Two reapers racing each other could both neuter down to the floor.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-reaper
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-reaper
+    spec:
+      serviceAccountName: {{ .Release.Name }}-reaper
+      restartPolicy: Always
+      containers:
+      - name: reaper
+        image: {{ .Values.reaper.image }}
+        imagePullPolicy: IfNotPresent
+        {{- if .Values.reaper.installDepsAtStartup }}
+        # TEST ONLY. Puts PyPI in the startup path of the run -- an outage or a
+        # yanked release becomes a mission failure. Use the prebuilt image
+        # (Dockerfile.reaper) for anything that matters.
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+          pip install --no-cache-dir --only-binary=:all: kubernetes==31.0.0 redis==5.2.1
+          exec python3 /scripts/reaper.py
+        {{- else }}
+        command: ["/usr/local/bin/python3", "/scripts/reaper.py"]
+        {{- end }}
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: STS_NAME
+          value: "{{ .Release.Name }}-stellar-core"
+        - name: VOLUME_NAME
+          value: "data-volume"
+        - name: REDIS_HOST
+          value: "{{ .Values.redis.hostname }}"
+        - name: REDIS_PORT
+          value: "{{ .Values.redis.port }}"
+        - name: JOB_QUEUE
+          value: "{{ .Values.redis.job_queue }}"
+        - name: PROGRESS_QUEUE
+          value: "{{ .Values.redis.progress_queue }}"
+        - name: JOB_OWNERS
+          value: "{{ .Values.redis.job_owners }}"
+        - name: MIN_WORKERS
+          value: "{{ .Values.reaper.minWorkers }}"
+        - name: CONFIRM_INTERVAL_SECONDS
+          value: "{{ .Values.reaper.confirmIntervalSeconds }}"
+        - name: POLL_INTERVAL_SECONDS
+          value: "{{ .Values.reaper.pollIntervalSeconds }}"
+        - name: MAX_REAPS_PER_CYCLE
+          value: "{{ .Values.reaper.maxReapsPerCycle }}"
+        - name: DRY_RUN
+          value: "{{ .Values.reaper.dryRun }}"
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        resources:
+          requests:
+            cpu: "{{ .Values.reaper.resources.requests.cpu }}"
+            memory: "{{ .Values.reaper.resources.requests.memory }}"
+          limits:
+            cpu: "{{ .Values.reaper.resources.limits.cpu }}"
+            memory: "{{ .Values.reaper.resources.limits.memory }}"
+      volumes:
+      - name: script
+        configMap:
+          name: {{ .Release.Name }}-reaper-script
+{{- end }}

@@ -131,6 +131,11 @@ type MissionOptions
         serviceAccountAnnotationsPcV2: seq<string>,
         s3HistoryMirrorOverridePcV2: string option,
         s3HistoryMirrorRegionPcV2: string,
+        reaperEnabledPcV2: bool,
+        reaperLivePcV2: bool,
+        reaperImagePcV2: string option,
+        reaperMinWorkersPcV2: int option,
+        reaperInstallDepsPcV2: bool,
         benchmarkInfrastructure: bool,
         benchmarkOnly: bool,
         benchmarkDurationSeconds: int,
@@ -599,6 +604,37 @@ type MissionOptions
              Default = "us-east-1")>]
     member self.S3HistoryMirrorRegionPcV2 = s3HistoryMirrorRegionPcV2
 
+    [<Option("reaper-enabled-pc-v2",
+             HelpText = "Run the idle-worker reaper, which makes idle ParallelCatchupV2 workers unschedulable at the tail of a run so their nodes can be reclaimed",
+             Required = false,
+             Default = false)>]
+    member self.ReaperEnabledPcV2 = reaperEnabledPcV2
+
+    // A switch, not a bool-with-value: CommandLineParser does not consume a
+    // following value for a bool, so `--reaper-dry-run-pc-v2 false` would
+    // silently leave dry-run on. Opting into live reaping has to be explicit.
+    [<Option("reaper-live-pc-v2",
+             HelpText = "Let the reaper actually neuter idle workers. Without this it only logs what it would do. Only applicable if --reaper-enabled-pc-v2 is also set.",
+             Required = false,
+             Default = false)>]
+    member self.ReaperLivePcV2 = reaperLivePcV2
+
+    [<Option("reaper-image-pc-v2",
+             HelpText = "Image for the reaper pod. Only applicable if --reaper-enabled-pc-v2 is also set.",
+             Required = false)>]
+    member self.ReaperImagePcV2 = reaperImagePcV2
+
+    [<Option("reaper-min-workers-pc-v2",
+             HelpText = "Reaper never reduces the fleet below this many live workers, so a requeued job is not starved. Only applicable if --reaper-enabled-pc-v2 is also set.",
+             Required = false)>]
+    member self.ReaperMinWorkersPcV2 = reaperMinWorkersPcV2
+
+    [<Option("reaper-install-deps-pc-v2",
+             HelpText = "TEST ONLY: pip-install the reaper's dependencies at pod start instead of using a prebuilt image, which puts PyPI in the startup path of the run. Only applicable if --reaper-enabled-pc-v2 is also set.",
+             Required = false,
+             Default = false)>]
+    member self.ReaperInstallDepsPcV2 = reaperInstallDepsPcV2
+
     [<Option("benchmark-infra",
              HelpText = "Run network infrastructure benchmark in addition to stellar-core tests",
              Required = false,
@@ -919,6 +955,11 @@ let main argv =
                                        (List.ofSeq mission.ServiceAccountAnnotationsPcV2)
                                s3HistoryMirrorOverridePcV2 = mission.S3HistoryMirrorOverridePcV2
                                s3HistoryMirrorRegionPcV2 = mission.S3HistoryMirrorRegionPcV2
+                               reaperEnabledPcV2 = mission.ReaperEnabledPcV2
+                               reaperDryRunPcV2 = not mission.ReaperLivePcV2
+                               reaperImagePcV2 = mission.ReaperImagePcV2
+                               reaperMinWorkersPcV2 = mission.ReaperMinWorkersPcV2
+                               reaperInstallDepsPcV2 = mission.ReaperInstallDepsPcV2
                                benchmarkInfrastructure = Some mission.BenchmarkInfrastructure
                                benchmarkInfrastructureOnly = Some mission.BenchmarkOnly
                                benchmarkDurationSeconds = Some mission.BenchmarkDurationSeconds

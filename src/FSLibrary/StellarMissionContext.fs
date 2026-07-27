@@ -141,6 +141,11 @@ type MissionContext =
       serviceAccountAnnotationsPcV2: ((string * string) list)
       s3HistoryMirrorOverridePcV2: string option
       s3HistoryMirrorRegionPcV2: string
+      reaperEnabledPcV2: bool
+      reaperDryRunPcV2: bool
+      reaperImagePcV2: string option
+      reaperMinWorkersPcV2: int option
+      reaperInstallDepsPcV2: bool
       benchmarkInfrastructure: bool option
       benchmarkInfrastructureOnly: bool option
       benchmarkDurationSeconds: int option

@@ -1,0 +1,68 @@
+{{- if .Values.reaper.enabled }}
+# RBAC for the idle-worker reaper.
+#
+# Deliberately namespaced and deliberately narrow. The reaper may delete pods
+# and may delete/create PVCs -- nothing else. In particular it has NO access to
+# PersistentVolumes and no patch verb anywhere, so it cannot strip a finalizer
+# and orphan an EBS volume. Reclaiming volumes stays the CSI driver's job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-reaper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-reaper
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+  # Read-only: needed to set ownerReferences on hold PVCs so that
+  # `helm uninstall` garbage-collects them along with the StatefulSet.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get"]
+---
+# StorageClasses are cluster-scoped, so the preflight check cannot be granted by
+# a namespaced Role. This is the only cluster-scoped grant the reaper gets, and
+# it is read-only on a non-sensitive resource. The preflight hard-aborts unless
+# the class is WaitForFirstConsumer, because under Immediate binding every hold
+# PVC would provision a real EBS volume instead of staying Pending.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-reaper-sc
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-reaper-sc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-reaper-sc
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-reaper
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-reaper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-reaper
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-reaper
+{{- end }}

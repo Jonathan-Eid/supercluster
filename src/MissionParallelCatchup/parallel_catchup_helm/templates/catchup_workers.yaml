@@ -40,6 +40,9 @@ spec:
         app: {{ .Release.Name }}-stellar-core
     spec:
       serviceAccountName: stellar-supercluster-{{ .Release.Name }}
+      # Room for worker.sh to forward SIGTERM and let stellar-core stop cleanly.
+      # Kept under the 120s a spot interruption notice gives us.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default 100 }}
       {{- if or .Values.worker.requireNodeLabels .Values.worker.avoidNodeLabels }}
       affinity:
         nodeAffinity:
@@ -76,11 +79,24 @@ spec:
           requests:
             cpu: "{{ .Values.worker.resources.requests.cpu}}"
             memory: "{{ .Values.worker.resources.requests.memory}}"
+            {{- if .Values.worker.dataStorageClass }}
+            # The DB, buckets and logs all live under /data, which is a PVC here,
+            # so they do not consume node ephemeral storage. Requesting the full
+            # emptyDir-sized amount would make ephemeral storage the binding
+            # dimension for bin-packing (a 100Gi root caps you at 2 workers/node)
+            # instead of cpu/memory. Only the container writable layer is left.
+            ephemeral-storage: "2Gi"
+            {{- else }}
             ephemeral-storage: "{{ .Values.worker.resources.requests.ephemeral_storage}}"
+            {{- end }}
           limits:
             cpu: "{{ .Values.worker.resources.limits.cpu}}"
             memory: "{{ .Values.worker.resources.limits.memory}}"
+            {{- if .Values.worker.dataStorageClass }}
+            ephemeral-storage: "4Gi"
+            {{- else }}
             ephemeral-storage: "{{ .Values.worker.resources.limits.ephemeral_storage}}"
+            {{- end }}
         command: ["/bin/sh", "/scripts/worker.sh"]
         ports:
         - containerPort: 11626
@@ -89,8 +105,16 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        # worker.sh compares this with /data/last_node to tell an in-place
+        # container restart (OOM-kill/crash) from a rescheduled pod (eviction).
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         - name: ASAN_OPTIONS
           value: {{ .Values.worker.asanOptions | quote }}
+        - name: RESUME_SKIP_NEWDB
+          value: {{ .Values.worker.resumeSkipNewDb | default false | quote }}
         envFrom:
         - configMapRef:
             name: {{ .Release.Name }}-worker-config
@@ -108,8 +132,10 @@ spec:
       - name: script
         configMap:
           name: {{ .Release.Name }}-worker-script
+      {{- if not .Values.worker.dataStorageClass }}
       - emptyDir: {}
         name: data-volume
+      {{- end }}
       {{- if not .Values.worker.unevenSched }}
       topologySpreadConstraints:
       - labelSelector:
@@ -121,6 +147,25 @@ spec:
         topologyKey: kubernetes.io/hostname
         whenUnsatisfiable: DoNotSchedule
       {{- end }}
+  {{- if .Values.worker.dataStorageClass }}
+  # The mission tears down with `helm uninstall` and never deletes the shared
+  # namespace, so without this the PVCs outlive the StatefulSet and their EBS
+  # volumes are never reclaimed.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Delete
+  # EBS-backed persistent /data so an evicted worker's partial catchup DB
+  # survives a restart and catchup resumes from the last-closed ledger.
+  volumeClaimTemplates:
+  - metadata:
+      name: data-volume
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: {{ .Values.worker.dataStorageClass }}
+      resources:
+        requests:
+          storage: {{ .Values.worker.dataStorageSize | default "100Gi" }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -15,6 +15,14 @@ redis:
 worker:
   stellar_core_image: "stellar/stellar-core:latest"
   replicas: 5
+  # dataStorageClass: "" -> /data is an emptyDir on instance NVMe (default).
+  # Set to an EBS StorageClass name -> /data becomes a per-worker PVC that
+  # survives pod restart (enables catchup resume). dataStorageSize sizes it.
+  dataStorageClass: ""
+  dataStorageSize: "50Gi"
+  # resumeSkipNewDb: true -> worker.sh skips new-db when a DB already exists on
+  # /data (a restored PVC), so catchup resumes instead of re-running the range.
+  resumeSkipNewDb: true
   requireNodeLabels: []
   avoidNodeLabels: []
   tolerateNodeTaints: []
@@ -58,3 +66,28 @@ range_generator:
 
 service_account:
   annotations: []
+
+# Idle-worker reaper: neuters idle workers at the tail of a run so Karpenter can
+# reap their nodes. See files/reaper.py and templates/reaper_rbac.yaml.
+reaper:
+  enabled: false
+  image: "stellar/ssc-catchup-reaper:latest"
+  # TEST ONLY: run on a stock python image and pip-install deps at pod start,
+  # so the reaper can be exercised before the image pipeline exists. Set the
+  # image to python:3.12-alpine when enabling this.
+  installDepsAtStartup: false
+  # Observe-only. Logs every decision without touching pods or PVCs.
+  dryRun: true
+  # Never scale below this many workers, so a requeued job is not starved.
+  minWorkers: 8
+  # An idle verdict must hold this long before a worker is neutered.
+  confirmIntervalSeconds: 30
+  pollIntervalSeconds: 30
+  maxReapsPerCycle: 64
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"

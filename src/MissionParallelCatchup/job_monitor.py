@@ -27,8 +27,15 @@ WORKER_PREFIX = os.getenv('WORKER_PREFIX', 'stellar-core')
 NAMESPACE = os.getenv('NAMESPACE', 'default')
 WORKER_COUNT = int(os.getenv('WORKER_COUNT', 3))
 LOGGING_INTERVAL_SECONDS = int(os.getenv('LOGGING_INTERVAL_SECONDS', 10))
-STUCK_JOB_PING_RETRIES = 3
-STUCK_JOB_PING_DELAY_SECS = 30
+# Reclaiming a job means another worker will run it from scratch, discarding the
+# partial DB on the original worker's PVC. A StatefulSet pod always returns under
+# the same name, so the confirmation window must comfortably exceed pod-return
+# time (~85s observed, minutes when spot capacity is tight) or we steal resumable
+# work from a worker that is merely restarting. This matters most in the straggler
+# tail, where few workers own jobs (so workers_up hits 0 easily) and the jobs being
+# lost are the multi-hour ones.
+STUCK_JOB_PING_RETRIES = int(os.getenv('STUCK_JOB_PING_RETRIES', 6))
+STUCK_JOB_PING_DELAY_SECS = int(os.getenv('STUCK_JOB_PING_DELAY_SECS', 60))
 
 def get_logging_level():
     name_to_level = {

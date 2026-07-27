@@ -13,6 +13,7 @@ open StellarKubeSpecs
 open StellarNetworkData
 open StellarNetworkDelays
 open MissionCatchupHelpers
+open MissionHistoryPubnetParallelCatchupV2
 open Xunit.Abstractions
 
 
@@ -137,6 +138,11 @@ let ctx : MissionContext =
       serviceAccountAnnotationsPcV2 = []
       s3HistoryMirrorOverridePcV2 = None
       s3HistoryMirrorRegionPcV2 = "us-east-1"
+      reaperEnabledPcV2 = false
+      reaperDryRunPcV2 = true
+      reaperImagePcV2 = None
+      reaperMinWorkersPcV2 = None
+      reaperInstallDepsPcV2 = false
       benchmarkInfrastructure = None
       benchmarkInfrastructureOnly = None
       benchmarkDurationSeconds = None
@@ -542,3 +548,65 @@ type Tests(output: ITestOutputHelper) =
         Assert.Equal("51/6", jobArr3.[0].[1])
         Assert.Equal("56/6", jobArr3.[1].[1])
         Assert.Equal("61/6", jobArr3.[2].[1])
+
+[<Fact>]
+let ``Parallel catchup worker requests pack a known worker count per node shape`` () =
+    // The requests are load-bearing: they decide how many workers the scheduler
+    // fits on each node shape we run catchup on. Guard the arithmetic so a tweak
+    // to the numbers cannot silently change fleet size (and therefore the spot
+    // vCPU footprint) without this test failing.
+    let req = ParallelCatchupCoreResourceRequirements.Requests
+    let cpuReq = req.["cpu"].ToDecimal()
+    // ResourceQuantity.ToDecimal() yields bytes for memory, cores for cpu
+    let memReqGi = req.["memory"].ToDecimal() / 1073741824m
+
+    // allocatable for each shape: total minus kubelet/system reservation
+    // (cpu: 60m+10m+5m+5m+2.5m/core beyond 4; memory: ~2.3GiB)
+    let workersOn (allocCpu: decimal) (allocMemGi: decimal) =
+        let byCpu = int (floor (allocCpu / cpuReq))
+        let byMem = int (floor (allocMemGi / memReqGi))
+        min byCpu byMem
+
+    // r8*.xlarge: cpu-bound
+    Assert.Equal(2, workersOn 3.92m 29.7m)
+    // m8*.2xlarge: memory-bound (same cpu as r8*.2xlarge, half the memory)
+    Assert.Equal(3, workersOn 7.91m 29.7m)
+    // r8*.2xlarge: cpu-bound
+    Assert.Equal(4, workersOn 7.91m 61.7m)
+
+    // cpu request must stay below the 2-vCPU limit so bursting is still possible
+    Assert.True(cpuReq < ParallelCatchupCoreResourceRequirements.Limits.["cpu"].ToDecimal())
+
+[<Fact>]
+let ``reaper helm options are off unless explicitly enabled`` () =
+    // The reaper deletes pods and PVCs, so the default must be inert: an
+    // unconfigured mission emits no reaper options at all and the chart's
+    // `reaper.enabled: false` stands.
+    Assert.Empty(reaperSetOptions ctx)
+
+    let enabled = { ctx with reaperEnabledPcV2 = true }
+    let opts = reaperSetOptions enabled
+    Assert.Contains("reaper.enabled=true", opts)
+    // dryRun defaults to true, so merely enabling the reaper still touches
+    // nothing until it is explicitly turned off.
+    Assert.Contains("reaper.dryRun=true", opts)
+    Assert.Contains("reaper.installDepsAtStartup=false", opts)
+    // image and minWorkers are unset -> chart defaults apply
+    Assert.DoesNotContain(opts, fun (o: string) -> o.StartsWith("reaper.image="))
+    Assert.DoesNotContain(opts, fun (o: string) -> o.StartsWith("reaper.minWorkers="))
+
+[<Fact>]
+let ``reaper helm options carry overrides through`` () =
+    let ctx' =
+        { ctx with
+            reaperEnabledPcV2 = true
+            reaperDryRunPcV2 = false
+            reaperImagePcV2 = Some "python:3.12-alpine"
+            reaperMinWorkersPcV2 = Some 4
+            reaperInstallDepsPcV2 = true }
+
+    let opts = reaperSetOptions ctx'
+    Assert.Contains("reaper.dryRun=false", opts)
+    Assert.Contains("reaper.image=python:3.12-alpine", opts)
+    Assert.Contains("reaper.minWorkers=4", opts)
+    Assert.Contains("reaper.installDepsAtStartup=true", opts)

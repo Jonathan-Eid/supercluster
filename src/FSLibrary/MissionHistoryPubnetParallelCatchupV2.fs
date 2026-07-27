@@ -26,7 +26,8 @@ open k8s
 open CSLibrary
 
 // Constants
-let helmChartPath = "/supercluster/src/MissionParallelCatchup/parallel_catchup_helm"
+// LOCAL-TEST EDIT: relative path for local driver runs. Do not commit.
+let helmChartPath = "src/MissionParallelCatchup/parallel_catchup_helm"
 
 // Comment out the path below for local testing
 // Example command to run local testing (in the `supercluster/` directory):
@@ -41,6 +42,24 @@ let jobMonitorLoggingIntervalSecs = 30 // frequency of job monitor's internal in
 let jobMonitorStatusCheckIntervalSecs = 60 // frequency of us querying job monitor's `/status` end point
 let jobMonitorMetricsCheckIntervalSecs = 60 // frequency of us querying job monitor's `/metrics` end point
 let jobMonitorStatusCheckTimeOutSecs = 600
+// Helm --set options for the idle-worker reaper. Pure so it can be tested
+// without standing up a cluster.
+let reaperSetOptions (context: MissionContext) : string list =
+    if not context.reaperEnabledPcV2 then
+        []
+    else
+        [ yield "reaper.enabled=true"
+          yield sprintf "reaper.dryRun=%b" context.reaperDryRunPcV2
+          yield sprintf "reaper.installDepsAtStartup=%b" context.reaperInstallDepsPcV2
+
+          match context.reaperImagePcV2 with
+          | Some image -> yield sprintf "reaper.image=%s" image
+          | None -> ()
+
+          match context.reaperMinWorkersPcV2 with
+          | Some n -> yield sprintf "reaper.minWorkers=%d" n
+          | None -> () ]
+
 let mutable toPerformCleanup = true
 let failedJobLogFileLineCount = 10000
 let failedJobLogStreamLineCount = 1000
@@ -169,6 +188,11 @@ let installProject (context: MissionContext) =
     | Some mirrorUrl -> [ 1 .. 3 ] |> List.iter (setS3HistoryGetCommand mirrorUrl)
     | None -> ()
 
+    // Idle-worker reaper. The chart refuses to render it without a
+    // worker.dataStorageClass, since the reaper works by replacing a worker's
+    // PVC with one that can never bind.
+    reaperSetOptions context |> List.iter setOptions.Add
+
     setOptions.Add(sprintf "monitor.hostname=%s" (jobMonitorHostName context))
     setOptions.Add(sprintf "monitor.path_prefix=/%s/%s" context.namespaceProperty helmReleaseName)
     setOptions.Add(sprintf "monitor.logging_interval_seconds=%d" jobMonitorLoggingIntervalSecs)
@@ -219,10 +243,15 @@ let installProject (context: MissionContext) =
     let expandedKubeCfg = ExpandHomeDirTilde context.kubeCfg
     Environment.SetEnvironmentVariable("KUBECONFIG", expandedKubeCfg)
 
+    // helm has no idea about --namespace: without an explicit -n it falls back
+    // to whatever namespace the kubeconfig context happens to carry, which is
+    // leftover state from whoever ran last.
     RunShellCommand [| "helm"
                        "install"
                        helmReleaseName
                        helmChartPath
+                       "-n"
+                       context.namespaceProperty
                        "--values"
                        valuesFilePath
                        "--set"
@@ -232,7 +261,9 @@ let installProject (context: MissionContext) =
     match RunShellCommand [| "helm"
                              "get"
                              "values"
-                             helmReleaseName |] with
+                             helmReleaseName
+                             "-n"
+                             context.namespaceProperty |] with
     | Some valuesOutput -> LogInfo "%s" valuesOutput
     | _ -> ()
 
@@ -303,7 +334,9 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "-n"
+                               context.namespaceProperty |]
             |> ignore
         else
             // Normal / legitimate-failure path: pods are still alive through
@@ -320,7 +353,9 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "-n"
+                               context.namespaceProperty |]
             |> ignore
 
 let mutable cleanupContext : MissionContext option = None

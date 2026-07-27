@@ -1,0 +1,14 @@
+FROM --platform=linux/amd64 python:3.12-alpine
+
+WORKDIR /app
+
+# --only-binary guarantees we never silently fall back to building from source
+# on musl (which would need a toolchain we do not ship).
+RUN pip install --no-cache-dir --only-binary=:all: \
+    kubernetes==31.0.0 \
+    redis==5.2.1
+
+# reaper.py is not baked in: the helm chart mounts it at /scripts/reaper.py from
+# a ConfigMap, so the reaping logic is reviewable as plain text in the chart and
+# can change without rebuilding this image.
+CMD ["/usr/local/bin/python3", "/scripts/reaper.py"]
