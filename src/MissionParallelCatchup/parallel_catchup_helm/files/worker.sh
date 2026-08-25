@@ -21,7 +21,26 @@ fi
 SLEEP_INTERVAL=10
 LOG_DIR="/data"
 
+# Our ordinal within the StatefulSet, e.g. "...-stellar-core-7" -> 7.
+ORDINAL=${POD_NAME##*-}
+
 while true; do
+# Stop claiming once there is less outstanding work than our ordinal, so the
+# high ordinals fall idle first and the driver can remove them. The cutoff is
+# queued + in-progress, not queued alone: with N jobs queued and the low
+# ordinals all busy, a cutoff of N would leave those N jobs unclaimable.
+OUTSTANDING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" <<EOF | awk '{ sum += $1 } END { print sum }'
+LLEN $JOB_QUEUE
+LLEN $PROGRESS_QUEUE
+EOF
+)
+# Fail open: an unreadable cutoff claims as before rather than idling the fleet.
+if [ -n "$OUTSTANDING" ] && [ "$ORDINAL" -ge "$OUTSTANDING" ] 2>/dev/null; then
+    echo "$(date) Ordinal $ORDINAL is at or above outstanding work ($OUTSTANDING); not claiming."
+    sleep $SLEEP_INTERVAL
+    continue
+fi
+
 # Fetch the next job key from the Redis queue.
 # Our ranges are generated in the order we want to run them from left to right, so we always pull from the left
 JOB_KEY=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" LMOVE "$JOB_QUEUE" "$PROGRESS_QUEUE" LEFT LEFT)
