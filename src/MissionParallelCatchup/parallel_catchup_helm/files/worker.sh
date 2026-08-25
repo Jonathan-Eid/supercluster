@@ -29,7 +29,9 @@ while true; do
 # high ordinals fall idle first and the driver can remove them. The cutoff is
 # queued + in-progress, not queued alone: with N jobs queued and the low
 # ordinals all busy, a cutoff of N would leave those N jobs unclaimable.
-OUTSTANDING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" <<EOF | awk '{ sum += $1 } END { print sum }'
+# Print nothing unless both replies are integers. Summing unconditionally would
+# turn an error reply into 0, which reads as "no work" and idles the whole fleet.
+OUTSTANDING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" <<EOF | awk '/^[0-9]+$/ { sum += $1; n += 1 } END { if (n == 2) print sum }'
 LLEN $JOB_QUEUE
 LLEN $PROGRESS_QUEUE
 EOF

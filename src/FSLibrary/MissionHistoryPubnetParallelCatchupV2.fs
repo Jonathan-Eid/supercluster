@@ -244,6 +244,12 @@ let installProject (context: MissionContext) =
 // The `max` is load-bearing. `highestBusy + 1` alone would remove pods that own
 // nothing right now but are still below the claim cutoff in worker.sh, so they
 // may claim at any moment. Flooring the target at the cutoff keeps them.
+
+// Retirement is synchronous inside the status loop: every retiring pod is
+// exec'd into and its archive streamed back before the patch. Cap the batch so
+// one pass cannot stall polling for minutes; later passes keep shrinking.
+let maxWorkersRetiredPerPass = 32
+
 let scaleDownTarget (owningPods: string seq) (queued: int) (inProgress: int) (current: int) : int option =
     let ordinalOf (podName: string) =
         match Int32.TryParse(podName.Substring(podName.LastIndexOf('-') + 1)) with
@@ -252,21 +258,23 @@ let scaleDownTarget (owningPods: string seq) (queued: int) (inProgress: int) (cu
 
     let highestBusy = owningPods |> Seq.choose ordinalOf |> Seq.fold max -1
 
-    let target = max (highestBusy + 1) (queued + inProgress)
+    let safeFloor = max (highestBusy + 1) (queued + inProgress)
+    let target = max safeFloor (current - maxWorkersRetiredPerPass)
     if target < current then Some target else None
 
-// Collect log files from all parallel catchup worker pods
-// This function:
-// 1. Automatically determines worker pod names from context.pubnetParallelCatchupNumWorkers
-// 2. For each pod, finds all files matching "stellar-core-*.log" in /data
-// 3. Creates a tar.gz archive and copies it to context.destination directory
-let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) =
-    // Pod names follow the pattern: <helmReleaseName>-stellar-core-0, <helmReleaseName>-stellar-core-1, etc.
-    let podNames = ordinals |> List.map (fun i -> sprintf "%s-stellar-core-%d" helmReleaseName i)
+// For each ordinal's pod, tars every "stellar-core-*.log" in /data and copies
+// the archive into context.destination.
+// Returns the ordinals whose collection attempt raised. An empty archive is not
+// a failure: a worker that never claimed a job has no logs to lose.
+let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) : int list =
+    LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length ordinals) context.destination.Path
 
-    LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length podNames) context.destination.Path
+    let mutable failedOrdinals = []
 
-    for podName in podNames do
+    for ordinal in ordinals do
+        // Pod names follow the pattern: <helmReleaseName>-stellar-core-0, <helmReleaseName>-stellar-core-1, etc.
+        let podName = sprintf "%s-stellar-core-%d" helmReleaseName ordinal
+
         try
             LogInfo "Collecting logs from pod: %s" podName
 
@@ -297,11 +305,15 @@ let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) =
 
         with ex ->
             LogWarn "Could not collect logs from pod %s (this is expected if pod doesn't exist): %s" podName ex.Message
+            failedOrdinals <- ordinal :: failedOrdinals
+
+    failedOrdinals
 
 // Collect from every worker the run was sized for. Retiring workers are
 // collected earlier, as they are removed.
 let collectLogsFromPods (context: MissionContext) =
     collectLogsFromOrdinals context [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
+    |> ignore
 
 // Cleanup on exit. `signalTriggered` indicates we're running under a hard
 // deadline (Jenkins' SoftKillWaitSeconds, ~5s by default, before SIGKILL).
@@ -451,32 +463,46 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                 // and the run's own collection only happens at cleanup. A failed
                 // attempt is not fatal: skip it and retry on the next poll rather
                 // than taking a multi-hour catchup down over a transient error.
-                if remainSize > 0 || JobsInProgress.Count > 0 then
+                // `queue_remain_count`, not `num_remain`: the two are equal in every
+                // published status, but the monitor's pre-first-poll placeholder
+                // carries `num_remain = 1` as a "something is running" sentinel. Read
+                // that as a queue depth and the very first poll retires the whole
+                // fleet down to one pod, with no scale-up path to come back from.
+                let queuedCount = status.Value<int>("queue_remain_count")
+
+                if queuedCount > 0 || JobsInProgress.Count > 0 then
                     try
                         let owningPods = (status.["workers"] :?> JArray) |> Seq.map (fun w -> w.Value<string>("pod"))
 
-                        match scaleDownTarget owningPods remainSize JobsInProgress.Count currentReplicas with
+                        match scaleDownTarget owningPods queuedCount JobsInProgress.Count currentReplicas with
                         | Some target ->
                             LogInfo
                                 "Scaling workers %d -> %d (%d queued, %d in progress)"
                                 currentReplicas
                                 target
-                                remainSize
+                                queuedCount
                                 JobsInProgress.Count
 
-                            collectLogsFromOrdinals context [ target .. currentReplicas - 1 ]
+                            // Only retire pods whose logs we actually hold. /data is
+                            // emptyDir, so patching past a failed collect loses them.
+                            match collectLogsFromOrdinals context [ target .. currentReplicas - 1 ] with
+                            | [] ->
+                                let patch =
+                                    V1Patch(sprintf """{"spec":{"replicas":%d}}""" target, V1Patch.PatchType.MergePatch)
 
-                            let patch =
-                                V1Patch(sprintf """{"spec":{"replicas":%d}}""" target, V1Patch.PatchType.MergePatch)
+                                context.kube.PatchNamespacedStatefulSetScale(
+                                    patch,
+                                    helmReleaseName + "-stellar-core",
+                                    context.namespaceProperty
+                                )
+                                |> ignore
 
-                            context.kube.PatchNamespacedStatefulSetScale(
-                                patch,
-                                helmReleaseName + "-stellar-core",
-                                context.namespaceProperty
-                            )
-                            |> ignore
-
-                            currentReplicas <- target
+                                currentReplicas <- target
+                            | failed ->
+                                LogWarn
+                                    "Not retiring workers this pass: log collection failed for %d of %d ordinal(s)"
+                                    (List.length failed)
+                                    (currentReplicas - target)
                         | None -> ()
                     with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 
