@@ -23,6 +23,7 @@ open System.Threading
 open System
 
 open k8s
+open k8s.Models
 open CSLibrary
 
 // Constants
@@ -236,17 +237,32 @@ let installProject (context: MissionContext) =
     | Some valuesOutput -> LogInfo "%s" valuesOutput
     | _ -> ()
 
+// The replica count the worker StatefulSet can safely be scaled down to, or
+// None when no scale-down is due. `owningPods` are the pods that currently hold
+// an in-progress job.
+//
+// The `max` is load-bearing. `highestBusy + 1` alone would remove pods that own
+// nothing right now but are still below the claim cutoff in worker.sh, so they
+// may claim at any moment. Flooring the target at the cutoff keeps them.
+let scaleDownTarget (owningPods: string seq) (queued: int) (inProgress: int) (current: int) : int option =
+    let ordinalOf (podName: string) =
+        match Int32.TryParse(podName.Substring(podName.LastIndexOf('-') + 1)) with
+        | true, ordinal -> Some ordinal
+        | _ -> None
+
+    let highestBusy = owningPods |> Seq.choose ordinalOf |> Seq.fold max -1
+
+    let target = max (highestBusy + 1) (queued + inProgress)
+    if target < current then Some target else None
+
 // Collect log files from all parallel catchup worker pods
 // This function:
 // 1. Automatically determines worker pod names from context.pubnetParallelCatchupNumWorkers
 // 2. For each pod, finds all files matching "stellar-core-*.log" in /data
 // 3. Creates a tar.gz archive and copies it to context.destination directory
-let collectLogsFromPods (context: MissionContext) =
-    // Generate pod names based on number of workers
+let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) =
     // Pod names follow the pattern: <helmReleaseName>-stellar-core-0, <helmReleaseName>-stellar-core-1, etc.
-    let podNames =
-        [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
-        |> List.map (fun i -> sprintf "%s-stellar-core-%d" helmReleaseName i)
+    let podNames = ordinals |> List.map (fun i -> sprintf "%s-stellar-core-%d" helmReleaseName i)
 
     LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length podNames) context.destination.Path
 
@@ -281,6 +297,11 @@ let collectLogsFromPods (context: MissionContext) =
 
         with ex ->
             LogWarn "Could not collect logs from pod %s (this is expected if pod doesn't exist): %s" podName ex.Message
+
+// Collect from every worker the run was sized for. Retiring workers are
+// collected earlier, as they are removed.
+let collectLogsFromPods (context: MissionContext) =
+    collectLogsFromOrdinals context [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
 
 // Cleanup on exit. `signalTriggered` indicates we're running under a hard
 // deadline (Jenkins' SoftKillWaitSeconds, ~5s by default, before SIGKILL).
@@ -395,6 +416,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
     installProject context
 
     let mutable allJobsFinished = false
+    let mutable currentReplicas = context.pubnetParallelCatchupNumWorkers
     let mutable timeoutLeft = jobMonitorStatusCheckTimeOutSecs
     let mutable timeBeforeNextMetricsCheck = jobMonitorMetricsCheckIntervalSecs
     let jobMonitorPath = "/" + context.namespaceProperty + "/" + helmReleaseName
@@ -423,6 +445,40 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                         LogInfo "<<<"
 
                     failwith "Catch up failed, check logs for more info"
+
+                // Retire the workers the queue can no longer keep busy. Their logs go
+                // first: /data is emptyDir, so a removed pod's logs are gone for good
+                // and the run's own collection only happens at cleanup. A failed
+                // attempt is not fatal: skip it and retry on the next poll rather
+                // than taking a multi-hour catchup down over a transient error.
+                if remainSize > 0 || JobsInProgress.Count > 0 then
+                    try
+                        let owningPods = (status.["workers"] :?> JArray) |> Seq.map (fun w -> w.Value<string>("pod"))
+
+                        match scaleDownTarget owningPods remainSize JobsInProgress.Count currentReplicas with
+                        | Some target ->
+                            LogInfo
+                                "Scaling workers %d -> %d (%d queued, %d in progress)"
+                                currentReplicas
+                                target
+                                remainSize
+                                JobsInProgress.Count
+
+                            collectLogsFromOrdinals context [ target .. currentReplicas - 1 ]
+
+                            let patch =
+                                V1Patch(sprintf """{"spec":{"replicas":%d}}""" target, V1Patch.PatchType.MergePatch)
+
+                            context.kube.PatchNamespacedStatefulSetScale(
+                                patch,
+                                helmReleaseName + "-stellar-core",
+                                context.namespaceProperty
+                            )
+                            |> ignore
+
+                            currentReplicas <- target
+                        | None -> ()
+                    with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 
                 if remainSize = 0 && JobsInProgress.Count = 0 then
                     // All jobs completed — perform a final query on the metrics
