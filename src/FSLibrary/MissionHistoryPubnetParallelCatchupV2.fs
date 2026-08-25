@@ -46,6 +46,10 @@ let failedJobLogFileLineCount = 10000
 let failedJobLogStreamLineCount = 1000
 
 let mutable nonce : String = ""
+// Workers not yet retired. Retired workers' logs are collected as they go, so
+// cleanup must not try to collect from a pod that is already deleted.
+let mutable liveWorkers : Set<int> = Set.empty
+
 let mutable helmReleaseName : String = ""
 
 let jobMonitorHostName (context: MissionContext) =
@@ -249,23 +253,41 @@ let workerPodName (index: int) = sprintf "%s-0" (workerStatefulSetName index)
 
 // Add pods to the retiring set that worker.sh checks before each claim. The
 // driver has no Redis route of its own, so it execs redis-cli in a worker that
-// already has one. `RunRemoteCommand` deadlocks above 4096 bytes, so the pod
-// names are sent in chunks well under it.
+// already has one.
+//
+// The command is fed to the shell on stdin, so it has to exit explicitly or the
+// shell sits there; `RunRemoteCommand` rejects a command with no `exit` in it.
+// `exit $?` rather than `exit 0` so a failing redis-cli is not reported as
+// success. It also rejects 4096 bytes or more, hence the chunking: 30 names at
+// roughly 50 bytes each stays far enough under that a longer release nonce
+// cannot cross it.
 let markRetiring (context: MissionContext) (viaWorker: int) (podNames: string list) =
-    for chunk in podNames |> List.chunkBySize 50 do
+    for chunk in podNames |> List.chunkBySize 30 do
         let args = chunk |> List.map (sprintf "'%s'") |> String.concat " "
 
         let cmd =
-            sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s\n" args
+            sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s\nexit $?\n" args
 
-        RemoteCommandRunner.RunRemoteCommand(
-            context.kube,
-            context.namespaceProperty,
-            workerPodName viaWorker,
-            "stellar-core",
-            cmd
-        )
-        |> ignore
+        let res =
+            RemoteCommandRunner.RunRemoteCommand(
+                context.kube,
+                context.namespaceProperty,
+                workerPodName viaWorker,
+                "stellar-core",
+                cmd
+            )
+
+        if res <> 0 then
+            failwithf "marking workers retiring failed on %s: exit %d" (workerPodName viaWorker) res
+
+// Highest index first, so the fleet shrinks from the top and the surviving
+// workers stay contiguous from 0.
+let private selectWorkers (live: Set<int>) (limit: int) (predicate: string -> bool) : int list =
+    live
+    |> Seq.sortDescending
+    |> Seq.filter (workerPodName >> predicate)
+    |> Seq.truncate limit
+    |> List.ofSeq
 
 // The workers to mark retiring this pass: idle, not already marked, and only as
 // many as the outstanding work lets us give up.
@@ -285,14 +307,7 @@ let workersToMark
     if surplus <= 0 then
         []
     else
-        live
-        |> Seq.sortDescending
-        |> Seq.filter
-            (fun i ->
-                let pod = workerPodName i
-                not (owningPods.Contains pod) && not (marked.Contains pod))
-        |> Seq.truncate surplus
-        |> List.ofSeq
+        selectWorkers live surplus (fun pod -> not (owningPods.Contains pod) && not (marked.Contains pod))
 
 // The marked workers that can be deleted now: still live, still idle, and marked
 // on an EARLIER pass.
@@ -303,26 +318,19 @@ let workersToMark
 // which worker.sh was provably barred from claiming. Deleting in the same pass as
 // marking reads as a harmless simplification and silently interrupts ranges.
 let workersToRemove (live: Set<int>) (owningPods: Set<string>) (markedEarlier: Set<string>) : int list =
-    live
-    |> Seq.sortDescending
-    |> Seq.filter
-        (fun i ->
-            let pod = workerPodName i
-            markedEarlier.Contains pod && not (owningPods.Contains pod))
-    |> Seq.truncate maxWorkersRetiredPerPass
-    |> List.ofSeq
+    selectWorkers live maxWorkersRetiredPerPass (fun pod -> markedEarlier.Contains pod && not (owningPods.Contains pod))
 
-// For each ordinal's pod, tars every "stellar-core-*.log" in /data and copies
+// For each index's pod, tars every "stellar-core-*.log" in /data and copies
 // the archive into context.destination.
-// Returns the ordinals whose collection attempt raised. An empty archive is not
+// Returns the indices whose collection attempt raised. An empty archive is not
 // a failure: a worker that never claimed a job has no logs to lose.
-let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) : int list =
-    LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length ordinals) context.destination.Path
+let collectLogsFromIndices (context: MissionContext) (indices: int list) : int list =
+    LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length indices) context.destination.Path
 
-    let mutable failedOrdinals = []
+    let mutable failedIndices = []
 
-    for ordinal in ordinals do
-        let podName = workerPodName ordinal
+    for index in indices do
+        let podName = workerPodName index
 
         try
             LogInfo "Collecting logs from pod: %s" podName
@@ -354,15 +362,13 @@ let collectLogsFromOrdinals (context: MissionContext) (ordinals: int list) : int
 
         with ex ->
             LogWarn "Could not collect logs from pod %s (this is expected if pod doesn't exist): %s" podName ex.Message
-            failedOrdinals <- ordinal :: failedOrdinals
+            failedIndices <- index :: failedIndices
 
-    failedOrdinals
+    failedIndices
 
 // Collect from every worker the run was sized for. Retiring workers are
 // collected earlier, as they are removed.
-let collectLogsFromPods (context: MissionContext) =
-    collectLogsFromOrdinals context [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
-    |> ignore
+let collectLogsFromPods (context: MissionContext) = collectLogsFromIndices context (List.ofSeq liveWorkers) |> ignore
 
 // Cleanup on exit. `signalTriggered` indicates we're running under a hard
 // deadline (Jenkins' SoftKillWaitSeconds, ~5s by default, before SIGKILL).
@@ -477,7 +483,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
     installProject context
 
     let mutable allJobsFinished = false
-    let mutable liveWorkers = Set.ofList [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
+    liveWorkers <- Set.ofList [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
     // Pods marked retiring on an earlier pass. Never shrinks: the queue only
     // drains, so a worker we could give up once is never needed again.
     let mutable markedPods : Set<string> = Set.empty
@@ -545,7 +551,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                             // Only delete workers whose logs we actually hold.
                             // /data is emptyDir, so deleting past a failed
                             // collect loses them for good.
-                            match collectLogsFromOrdinals context removable with
+                            match collectLogsFromIndices context removable with
                             | [] ->
                                 for index in removable do
                                     context.kube.DeleteNamespacedStatefulSet(
