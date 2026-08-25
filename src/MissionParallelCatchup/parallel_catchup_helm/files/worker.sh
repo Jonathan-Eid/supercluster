@@ -20,25 +20,17 @@ fi
 
 SLEEP_INTERVAL=10
 LOG_DIR="/data"
-
-# Our ordinal within the StatefulSet, e.g. "...-stellar-core-7" -> 7.
-ORDINAL=${POD_NAME##*-}
+# The driver adds a pod here when it intends to remove that worker.
+RETIRING_SET="$RELEASE_NAME-retiring"
 
 while true; do
-# Stop claiming once there is less outstanding work than our ordinal, so the
-# high ordinals fall idle first and the driver can remove them. The cutoff is
-# queued + in-progress, not queued alone: with N jobs queued and the low
-# ordinals all busy, a cutoff of N would leave those N jobs unclaimable.
-# Print nothing unless both replies are integers. Summing unconditionally would
-# turn an error reply into 0, which reads as "no work" and idles the whole fleet.
-OUTSTANDING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" <<EOF | awk '/^[0-9]+$/ { sum += $1; n += 1 } END { if (n == 2) print sum }'
-LLEN $JOB_QUEUE
-LLEN $PROGRESS_QUEUE
-EOF
-)
-# Fail open: an unreadable cutoff claims as before rather than idling the fleet.
-if [ -n "$OUTSTANDING" ] && [ "$ORDINAL" -ge "$OUTSTANDING" ] 2>/dev/null; then
-    echo "$(date) Ordinal $ORDINAL is at or above outstanding work ($OUTSTANDING); not claiming."
+# Stop claiming once the driver has marked us retiring, so it can delete us
+# without interrupting a range. Only an exact "1" bars a claim: any other reply,
+# including an error or empty output, claims as before rather than idling the
+# fleet over a transient Redis blip.
+RETIRING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" SISMEMBER "$RETIRING_SET" "$POD_NAME")
+if [ "$RETIRING" = "1" ]; then
+    echo "$(date) $POD_NAME is marked retiring; not claiming."
     sleep $SLEEP_INTERVAL
     continue
 fi
@@ -98,13 +90,9 @@ if [ $LMOVE_EXIT_CODE -eq 0 ] && [ -n "$JOB_KEY" ]; then
     fi
 
     # Push metrics to redis in a transaction to ensure data consistency. Retry for 5min on failures
-    # Extract the pod ordinal (last hyphen-separated segment) from pod name like "release-name-stellar-core-0"
-    core_id=$(echo "$POD_NAME" | awk -F'-' '{print $NF}')
-    # Validate core_id was extracted successfully
-    if [ -z "$core_id" ]; then
-        echo "Error: Failed to extract core_id from POD_NAME: $POD_NAME"
-        core_id="N/A"
-    fi
+    # The whole pod name. With one replica per StatefulSet the trailing segment
+    # is always "0", so it no longer identifies the worker.
+    core_id=$POD_NAME
 
     result=1  # Initialize to failure
     for i in $(seq 1 30);do
