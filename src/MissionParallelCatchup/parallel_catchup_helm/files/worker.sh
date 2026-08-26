@@ -24,8 +24,15 @@ LOG_DIR="/data"
 RETIRING_SET="$RELEASE_NAME-retiring"
 # ...and we add ourselves here to say we have seen it and are between jobs.
 RETIRED_SET="$RELEASE_NAME-retired"
+# Heartbeat: proves to the driver that this pod is running worker.sh right now.
+READY_SET="$RELEASE_NAME-ready"
 
 while true; do
+# Beat first. The driver counts recent beats as its available capacity and picks
+# a beating pod to run redis commands in. A Pending pod cannot beat, so it is
+# never counted as spare capacity and never chosen as the command host.
+redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ZADD "$READY_SET" "$(date +%s)" "$POD_NAME" >/dev/null
+
 # Stop claiming once the driver has marked us retiring, so it can delete us
 # without interrupting a range. Only an exact "1" bars a claim: any other reply,
 # including an error or empty output, claims as before rather than idling the

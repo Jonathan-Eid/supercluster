@@ -252,81 +252,127 @@ let workerStatefulSetName (index: int) = sprintf "%s-stellar-core-%d" helmReleas
 
 let workerPodName (index: int) = sprintf "%s-0" (workerStatefulSetName index)
 
-// Add pods to the retiring set that worker.sh checks before each claim. The
-// driver has no Redis route of its own, so it execs redis-cli in a worker that
-// already has one.
+// A worker whose heartbeat is older than this is not counted as capacity and is
+// not used to run commands. worker.sh beats every SLEEP_INTERVAL (10s).
+let readyStaleSecs = 45
+
+let indexOfPodName (podName: string) : int option =
+    // "<release>-stellar-core-<i>-0" -> i
+    let parts = podName.Split('-')
+
+    if parts.Length < 2 then
+        None
+    else
+        match Int32.TryParse(parts.[parts.Length - 2]) with
+        | true, i -> Some i
+        | _ -> None
+
+// Run a shell command in the first worker that answers, returning whether any did.
 //
-// The command is fed to the shell on stdin, so it has to exit explicitly or the
-// shell sits there; `RunRemoteCommand` rejects a command with no `exit` in it.
-// `exit $?` rather than `exit 0` so a failing redis-cli is not reported as
-// success. It also rejects 4096 bytes or more, hence the chunking: 30 names at
-// roughly 50 bytes each stays far enough under that a longer release nonce
-// cannot cross it.
-// Returns the pods actually committed. A chunk that fails partway through must not
-// discard the record of the chunks that already landed, or the driver's view and
-// Redis diverge: those pods stop claiming with nothing tracking that they were told to.
-let markRetiring (context: MissionContext) (viaWorker: int) (podNames: string list) : string list =
+// `liveWorkers` is what the driver asked helm to render, not what is running. A
+// Pending pod is not exec-able, and betting on the lowest index is what silently
+// disabled every scale-down pass of a 40-worker run once worker 0 could not be
+// scheduled: the exec failed the websocket upgrade, the exception unwound the
+// whole pass, and the log still claimed workers were being marked. Prefer pods
+// that have heartbeated, then fall back to any live index to break the
+// chicken-and-egg on the very first read.
+let execInAnyWorker (context: MissionContext) (preferred: Set<int>) (cmd: string) (outFile: string option) : bool =
+    let candidates =
+        Seq.append (Seq.sort preferred) (liveWorkers |> Seq.sort |> Seq.filter (preferred.Contains >> not))
+
+    candidates
+    |> Seq.exists
+        (fun i ->
+            try
+                match outFile with
+                | Some path ->
+                    RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+                        kube = context.kube,
+                        ns = context.namespaceProperty,
+                        podName = workerPodName i,
+                        containerName = "stellar-core",
+                        command = [| "sh"; "-c"; cmd |],
+                        outputFilePath = path
+                    )
+
+                    true
+                | None ->
+                    RemoteCommandRunner.RunRemoteCommand(
+                        context.kube,
+                        context.namespaceProperty,
+                        workerPodName i,
+                        "stellar-core",
+                        cmd + "\nexit $?\n"
+                    ) = 0
+            with _ -> false)
+
+let private readPodSet (context: MissionContext) (preferred: Set<int>) (name: string) (cmd: string) : Set<string> =
+    let outFile = Path.Combine(Path.GetTempPath(), sprintf "%s-%s.txt" helmReleaseName name)
+
+    if execInAnyWorker context preferred cmd (Some outFile) then
+        File.ReadAllLines outFile
+        |> Seq.map (fun line -> line.Trim())
+        |> Seq.filter (fun line -> line <> "")
+        |> Set.ofSeq
+    else
+        LogWarn "Could not read %s: no worker answered" name
+        Set.empty
+
+// Workers that beat recently, so are provably running worker.sh. The cutoff is
+// computed with the pod's own clock, because the driver runs outside the cluster
+// and its clock cannot be assumed to agree.
+let readyWorkers (context: MissionContext) : Set<int> =
+    let cmd =
+        sprintf
+            "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" ZRANGEBYSCORE \"$RELEASE_NAME-ready\" $(( $(date +%%s) - %d )) +inf"
+            readyStaleSecs
+
+    readPodSet context Set.empty "ready" cmd
+    |> Set.map indexOfPodName
+    |> Set.filter Option.isSome
+    |> Set.map Option.get
+
+// Pods that have announced they saw the retiring mark while between jobs. This,
+// not the status snapshot, is what authorises a deletion.
+let retiredPods (context: MissionContext) (preferred: Set<int>) : Set<string> =
+    readPodSet
+        context
+        preferred
+        "retired"
+        "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SMEMBERS \"$RELEASE_NAME-retired\""
+
+// Add pods to the retiring set that worker.sh checks before each claim. Returns
+// the pods actually committed: a chunk that fails partway through must not discard
+// the record of the chunks that already landed, or the driver's view and Redis
+// diverge and those pods stop claiming with nothing tracking them. An exec that
+// throws counts as a failed chunk, not as an aborted pass.
+let markRetiring (context: MissionContext) (preferred: Set<int>) (podNames: string list) : string list =
     let committed = ResizeArray<string>()
-    let mutable failure = None
+    let mutable stop = false
 
     for chunk in podNames |> List.chunkBySize 30 do
-        if failure.IsNone then
+        if not stop then
             let args = chunk |> List.map (sprintf "'%s'") |> String.concat " "
 
             let cmd =
-                sprintf
-                    "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s\nexit $?\n"
-                    args
+                sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s" args
 
-            let res =
-                RemoteCommandRunner.RunRemoteCommand(
-                    context.kube,
-                    context.namespaceProperty,
-                    workerPodName viaWorker,
-                    "stellar-core",
-                    cmd
-                )
-
-            if res = 0 then committed.AddRange chunk else failure <- Some res
-
-    match failure with
-    | Some res -> LogWarn "Marking workers retiring failed on %s: exit %d" (workerPodName viaWorker) res
-    | None -> ()
+            if execInAnyWorker context preferred cmd None then
+                committed.AddRange chunk
+            else
+                LogWarn "Marking workers retiring failed; %d of %d committed" committed.Count podNames.Length
+                stop <- true
 
     List.ofSeq committed
 
 // Highest index first, so the fleet shrinks from the top and the surviving
 // workers stay contiguous from 0.
-let private selectWorkers (live: Set<int>) (limit: int) (predicate: string -> bool) : int list =
-    live
+let private selectWorkers (candidates: Set<int>) (limit: int) (predicate: string -> bool) : int list =
+    candidates
     |> Seq.sortDescending
     |> Seq.filter (workerPodName >> predicate)
     |> Seq.truncate limit
     |> List.ofSeq
-
-// The pods that have announced they saw the retiring mark while between jobs. This,
-// not the status snapshot, is what authorises a deletion.
-let retiredPods (context: MissionContext) (viaWorker: int) : Set<string> =
-    let outFile = Path.Combine(Path.GetTempPath(), sprintf "%s-retired.txt" helmReleaseName)
-
-    let command =
-        [| "sh"
-           "-c"
-           "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SMEMBERS \"$RELEASE_NAME-retired\"" |]
-
-    RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
-        kube = context.kube,
-        ns = context.namespaceProperty,
-        podName = workerPodName viaWorker,
-        containerName = "stellar-core",
-        command = command,
-        outputFilePath = outFile
-    )
-
-    File.ReadAllLines outFile
-    |> Seq.map (fun line -> line.Trim())
-    |> Seq.filter (fun line -> line <> "")
-    |> Set.ofSeq
 
 // The workers to mark retiring this pass: idle, not already marked, and only as
 // many as the outstanding work lets us give up.
@@ -335,18 +381,18 @@ let retiredPods (context: MissionContext) (viaWorker: int) : Set<string> =
 // every other worker busy, a floor of N would mark workers the queue still needs
 // and leave those N jobs unclaimable.
 let workersToMark
-    (live: Set<int>)
+    (ready: Set<int>)
     (owningPods: Set<string>)
     (marked: Set<string>)
     (queued: int)
     (inProgress: int)
     : int list =
-    let surplus = live.Count - (queued + inProgress)
+    let surplus = ready.Count - (queued + inProgress)
 
     if surplus <= 0 then
         []
     else
-        selectWorkers live surplus (fun pod -> not (owningPods.Contains pod) && not (marked.Contains pod))
+        selectWorkers ready surplus (fun pod -> not (owningPods.Contains pod) && not (marked.Contains pod))
 
 // The workers that can be deleted now: live, and announced as retired by the worker
 // itself.
@@ -584,19 +630,22 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                             |> Seq.map (fun w -> w.Value<string>("pod"))
                             |> Set.ofSeq
 
-                        // Every exec needs a live worker to run in. Nothing to do
-                        // once the fleet is empty.
-                        let viaWorker = Set.minElement liveWorkers
+                        // Only workers that beat recently count as capacity or can
+                        // host a command. A Pending pod does neither, and counting it
+                        // as spare capacity marks workers the queue still needs, then
+                        // retires them the moment they schedule.
+                        let ready = readyWorkers context
 
-                        let acked = if markedPods.IsEmpty then Set.empty else retiredPods context viaWorker
+                        let acked = if markedPods.IsEmpty then Set.empty else retiredPods context ready
 
                         let removable = workersToRemove liveWorkers acked
 
                         if not removable.IsEmpty then
                             LogInfo
-                                "Removing %d retired workers (%d live, %d queued, %d in progress)"
-                                removable.Length
+                                "Removing retired workers %A (%d live, %d ready, %d queued, %d in progress)"
+                                removable
                                 liveWorkers.Count
+                                ready.Count
                                 queuedCount
                                 JobsInProgress.Count
 
@@ -638,12 +687,20 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                                     failed.Length
                                     removable.Length
 
-                        let toMark = workersToMark liveWorkers owningPods markedPods queuedCount JobsInProgress.Count
+                        let toMark = workersToMark ready owningPods markedPods queuedCount JobsInProgress.Count
 
                         if not toMark.IsEmpty then
-                            LogInfo "Marking %d workers retiring" toMark.Length
-                            let committed = markRetiring context viaWorker (toMark |> List.map workerPodName)
+                            // Logged after the fact with the committed count, not
+                            // before with the intended one: a run once logged seven
+                            // marking waves having marked nothing at all.
+                            let committed = markRetiring context ready (toMark |> List.map workerPodName)
                             markedPods <- Set.union markedPods (Set.ofList committed)
+
+                            LogInfo
+                                "Marked %d of %d workers retiring (%d ready)"
+                                committed.Length
+                                toMark.Length
+                                ready.Count
                     with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 
                 if remainSize = 0 && JobsInProgress.Count = 0 then
