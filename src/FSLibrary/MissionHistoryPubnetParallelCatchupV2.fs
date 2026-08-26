@@ -261,24 +261,38 @@ let workerPodName (index: int) = sprintf "%s-0" (workerStatefulSetName index)
 // success. It also rejects 4096 bytes or more, hence the chunking: 30 names at
 // roughly 50 bytes each stays far enough under that a longer release nonce
 // cannot cross it.
-let markRetiring (context: MissionContext) (viaWorker: int) (podNames: string list) =
+// Returns the pods actually committed. A chunk that fails partway through must not
+// discard the record of the chunks that already landed, or the driver's view and
+// Redis diverge: those pods stop claiming with nothing tracking that they were told to.
+let markRetiring (context: MissionContext) (viaWorker: int) (podNames: string list) : string list =
+    let committed = ResizeArray<string>()
+    let mutable failure = None
+
     for chunk in podNames |> List.chunkBySize 30 do
-        let args = chunk |> List.map (sprintf "'%s'") |> String.concat " "
+        if failure.IsNone then
+            let args = chunk |> List.map (sprintf "'%s'") |> String.concat " "
 
-        let cmd =
-            sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s\nexit $?\n" args
+            let cmd =
+                sprintf
+                    "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SADD \"$RELEASE_NAME-retiring\" %s\nexit $?\n"
+                    args
 
-        let res =
-            RemoteCommandRunner.RunRemoteCommand(
-                context.kube,
-                context.namespaceProperty,
-                workerPodName viaWorker,
-                "stellar-core",
-                cmd
-            )
+            let res =
+                RemoteCommandRunner.RunRemoteCommand(
+                    context.kube,
+                    context.namespaceProperty,
+                    workerPodName viaWorker,
+                    "stellar-core",
+                    cmd
+                )
 
-        if res <> 0 then
-            failwithf "marking workers retiring failed on %s: exit %d" (workerPodName viaWorker) res
+            if res = 0 then committed.AddRange chunk else failure <- Some res
+
+    match failure with
+    | Some res -> LogWarn "Marking workers retiring failed on %s: exit %d" (workerPodName viaWorker) res
+    | None -> ()
+
+    List.ofSeq committed
 
 // Highest index first, so the fleet shrinks from the top and the surviving
 // workers stay contiguous from 0.
@@ -288,6 +302,30 @@ let private selectWorkers (live: Set<int>) (limit: int) (predicate: string -> bo
     |> Seq.filter (workerPodName >> predicate)
     |> Seq.truncate limit
     |> List.ofSeq
+
+// The pods that have announced they saw the retiring mark while between jobs. This,
+// not the status snapshot, is what authorises a deletion.
+let retiredPods (context: MissionContext) (viaWorker: int) : Set<string> =
+    let outFile = Path.Combine(Path.GetTempPath(), sprintf "%s-retired.txt" helmReleaseName)
+
+    let command =
+        [| "sh"
+           "-c"
+           "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" SMEMBERS \"$RELEASE_NAME-retired\"" |]
+
+    RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+        kube = context.kube,
+        ns = context.namespaceProperty,
+        podName = workerPodName viaWorker,
+        containerName = "stellar-core",
+        command = command,
+        outputFilePath = outFile
+    )
+
+    File.ReadAllLines outFile
+    |> Seq.map (fun line -> line.Trim())
+    |> Seq.filter (fun line -> line <> "")
+    |> Set.ofSeq
 
 // The workers to mark retiring this pass: idle, not already marked, and only as
 // many as the outstanding work lets us give up.
@@ -309,16 +347,21 @@ let workersToMark
     else
         selectWorkers live surplus (fun pod -> not (owningPods.Contains pod) && not (marked.Contains pod))
 
-// The marked workers that can be deleted now: still live, still idle, and marked
-// on an EARLIER pass.
+// The workers that can be deleted now: live, and announced as retired by the worker
+// itself.
 //
-// The earlier-pass requirement is the entire safety property. The status snapshot
-// is up to one monitor refresh stale, so a worker that looks idle in it may have
-// claimed since; a worker marked on a previous pass has had a full interval in
-// which worker.sh was provably barred from claiming. Deleting in the same pass as
-// marking reads as a harmless simplification and silently interrupts ranges.
-let workersToRemove (live: Set<int>) (owningPods: Set<string>) (markedEarlier: Set<string>) : int list =
-    selectWorkers live maxWorkersRetiredPerPass (fun pod -> markedEarlier.Contains pod && not (owningPods.Contains pod))
+// The announcement is the entire safety property, and it has to come from the worker
+// rather than from the status snapshot. The monitor reads job ownership at the start
+// of its cycle and republishes only after serially pinging every owner, so a snapshot
+// the driver reads can be older than the mark that preceded it. Two consecutive polls
+// can see the same stale snapshot, and a worker that claimed a range in between reads
+// as idle in both. Judging idleness that way deletes a worker mid-range, and the
+// monitor requeues in-progress work only when EVERY owner is unreachable -- so that
+// range is never retried and the mission never finishes draining. A pod in the retired
+// set has told us it reached the top of its claim loop with the mark already set: a
+// fact about the worker, not an inference about a snapshot's age.
+let workersToRemove (live: Set<int>) (acked: Set<string>) : int list =
+    selectWorkers live maxWorkersRetiredPerPass acked.Contains
 
 // For each index's pod, tars every "stellar-core-*.log" in /data and copies
 // the archive into context.destination.
@@ -484,8 +527,12 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
 
     let mutable allJobsFinished = false
     liveWorkers <- Set.ofList [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
-    // Pods marked retiring on an earlier pass. Never shrinks: the queue only
-    // drains, so a worker we could give up once is never needed again.
+    // Pods we have already asked to retire, kept only so the same mark is not
+    // re-issued every pass. Not a safety mechanism -- the retired set is. Marking is
+    // never reversed even though the monitor's stuck-job path can return in-progress
+    // work to the queue, so the queue does not strictly drain. The cost of that is a
+    // smaller fleet for the rest of the run, never a stall, because marking always
+    // leaves queued + in-progress workers unmarked.
     let mutable markedPods : Set<string> = Set.empty
     let mutable timeoutLeft = jobMonitorStatusCheckTimeOutSecs
     let mutable timeBeforeNextMetricsCheck = jobMonitorMetricsCheckIntervalSecs
@@ -529,41 +576,55 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                 // first poll retires the whole fleet.
                 let queuedCount = status.Value<int>("queue_remain_count")
 
-                if queuedCount > 0 || JobsInProgress.Count > 0 then
+                if (queuedCount > 0 || JobsInProgress.Count > 0) && not liveWorkers.IsEmpty then
                     try
                         let owningPods =
                             (status.["workers"] :?> JArray)
                             |> Seq.map (fun w -> w.Value<string>("pod"))
                             |> Set.ofSeq
 
-                        // Remove before marking, so nothing marked in this pass
-                        // can be deleted in it.
-                        let removable = workersToRemove liveWorkers owningPods markedPods
+                        // Every exec needs a live worker to run in. Nothing to do
+                        // once the fleet is empty.
+                        let viaWorker = Set.minElement liveWorkers
+
+                        let acked = if markedPods.IsEmpty then Set.empty else retiredPods context viaWorker
+
+                        let removable = workersToRemove liveWorkers acked
 
                         if not removable.IsEmpty then
                             LogInfo
-                                "Removing %d retiring workers (%d live, %d queued, %d in progress)"
+                                "Removing %d retired workers (%d live, %d queued, %d in progress)"
                                 removable.Length
                                 liveWorkers.Count
                                 queuedCount
                                 JobsInProgress.Count
 
-                            // Only delete workers whose logs we actually hold.
-                            // /data is emptyDir, so deleting past a failed
-                            // collect loses them for good.
-                            match collectLogsFromIndices context removable with
-                            | [] ->
-                                for index in removable do
+                            // Collect before deleting: /data is emptyDir, so a pod
+                            // deleted before its logs are read loses them for good.
+                            // Only the workers whose collection failed are held back;
+                            // failing the whole batch on one of them lets a single pod
+                            // stall every removal for the rest of the run.
+                            let failed = collectLogsFromIndices context removable
+
+                            for index in removable |> List.filter (fun i -> not (List.contains i failed)) do
+                                try
                                     context.kube.DeleteNamespacedStatefulSet(
                                         workerStatefulSetName index,
                                         context.namespaceProperty
                                     )
                                     |> ignore
 
-                                liveWorkers <- Set.difference liveWorkers (Set.ofList removable)
-                            | failed ->
+                                    // Per worker, not once per batch: a throw partway
+                                    // through would otherwise leave already-deleted
+                                    // workers recorded as live, and every later pass
+                                    // would re-select them and fail collecting from a
+                                    // pod that no longer exists.
+                                    liveWorkers <- Set.remove index liveWorkers
+                                with ex -> LogWarn "Could not remove worker %d: %s" index ex.Message
+
+                            if not failed.IsEmpty then
                                 LogWarn
-                                    "Not removing workers this pass: log collection failed for %d of %d"
+                                    "Held back %d of %d workers: log collection failed"
                                     failed.Length
                                     removable.Length
 
@@ -571,8 +632,8 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
 
                         if not toMark.IsEmpty then
                             LogInfo "Marking %d workers retiring" toMark.Length
-                            markRetiring context (Set.minElement liveWorkers) (toMark |> List.map workerPodName)
-                            markedPods <- Set.union markedPods (toMark |> List.map workerPodName |> Set.ofList)
+                            let committed = markRetiring context viaWorker (toMark |> List.map workerPodName)
+                            markedPods <- Set.union markedPods (Set.ofList committed)
                     with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 
                 if remainSize = 0 && JobsInProgress.Count = 0 then

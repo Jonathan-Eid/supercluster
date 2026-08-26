@@ -22,6 +22,8 @@ SLEEP_INTERVAL=10
 LOG_DIR="/data"
 # The driver adds a pod here when it intends to remove that worker.
 RETIRING_SET="$RELEASE_NAME-retiring"
+# ...and we add ourselves here to say we have seen it and are between jobs.
+RETIRED_SET="$RELEASE_NAME-retired"
 
 while true; do
 # Stop claiming once the driver has marked us retiring, so it can delete us
@@ -30,6 +32,12 @@ while true; do
 # fleet over a transient Redis blip.
 RETIRING=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" SISMEMBER "$RETIRING_SET" "$POD_NAME")
 if [ "$RETIRING" = "1" ]; then
+    # Announce it. This runs at the top of the loop, after any previous job's
+    # completion transaction and before the next claim, so a pod in the retired
+    # set provably holds no job -- and having seen the mark, it never claims
+    # again. The driver deletes only announced pods, so it never has to judge
+    # idleness from a status snapshot whose age it cannot bound.
+    redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" SADD "$RETIRED_SET" "$POD_NAME" >/dev/null
     echo "$(date) $POD_NAME is marked retiring; not claiming."
     sleep $SLEEP_INTERVAL
     continue
