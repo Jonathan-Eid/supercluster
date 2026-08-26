@@ -292,7 +292,7 @@ let readyPods (context: MissionContext) : Set<string> =
         context.kube.ListNamespacedPod(context.namespaceProperty, labelSelector = selector)
 
     pods.Items
-    |> Seq.filter (fun pod -> pod.Status.Phase = "Running")
+    |> Seq.filter (fun pod -> pod.Status.Phase = "Running" && isNull (box pod.Metadata.DeletionTimestamp))
     |> Seq.map (fun pod -> pod.Metadata.Name)
     |> Set.ofSeq
 
@@ -467,7 +467,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                 let outstanding = status.Value<int>("queue_remain_count") + JobsInProgress.Count
 
                 try
-                    let ready = readyPods context
+                    let mutable ready = readyPods context
                     // Read job_owners directly so it is current, not as old as the status snapshot.
                     let busy = redisIn context (Seq.head ready) "HVALS job_owners" |> Set.ofList
                     let removable = marked |> Set.filter (fun p -> ready.Contains p && not (busy.Contains p))
@@ -484,6 +484,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
 
                             marked <- Set.difference marked removable
                             livePods <- Set.difference livePods removable
+                            ready <- Set.difference ready removable
                             LogInfo "Retired %d workers (%d outstanding)" removable.Count outstanding
                         | failed -> LogWarn "Not retiring: log collection failed for %d workers" failed.Length
 
