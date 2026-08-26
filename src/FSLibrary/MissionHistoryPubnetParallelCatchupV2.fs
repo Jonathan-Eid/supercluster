@@ -47,6 +47,8 @@ let failedJobLogStreamLineCount = 1000
 
 let mutable nonce : String = ""
 let mutable helmReleaseName : String = ""
+// Pods not yet retired; module scope because cleanup runs from a signal handler.
+let mutable livePods : Set<string> = Set.empty
 
 let jobMonitorHostName (context: MissionContext) =
     match context.jobMonitorExternalHost with
@@ -241,12 +243,9 @@ let installProject (context: MissionContext) =
 // 1. Automatically determines worker pod names from context.pubnetParallelCatchupNumWorkers
 // 2. For each pod, finds all files matching "stellar-core-*.log" in /data
 // 3. Creates a tar.gz archive and copies it to context.destination directory
-let collectLogsFromPods (context: MissionContext) =
-    // Generate pod names based on number of workers
-    // Pod names follow the pattern: <helmReleaseName>-stellar-core-0, <helmReleaseName>-stellar-core-1, etc.
-    let podNames =
-        [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
-        |> List.map (fun i -> sprintf "%s-stellar-core-%d" helmReleaseName i)
+// Returns the pods whose collection raised; an empty archive is success.
+let collectLogsFromPods (context: MissionContext) (podNames: string list) : string list =
+    let mutable failed = []
 
     LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length podNames) context.destination.Path
 
@@ -281,6 +280,40 @@ let collectLogsFromPods (context: MissionContext) =
 
         with ex ->
             LogWarn "Could not collect logs from pod %s (this is expected if pod doesn't exist): %s" podName ex.Message
+            failed <- podName :: failed
+
+    failed
+
+// Running pods only, since a Pending pod reads as idle capacity it cannot supply.
+let readyPods (context: MissionContext) : Set<string> =
+    let selector = "app=" + helmReleaseName + "-stellar-core"
+
+    let pods =
+        context.kube.ListNamespacedPod(context.namespaceProperty, labelSelector = selector)
+
+    pods.Items
+    |> Seq.filter (fun pod -> pod.Status.Phase = "Running")
+    |> Seq.map (fun pod -> pod.Metadata.Name)
+    |> Set.ofSeq
+
+// Runs redis-cli in a ready worker and returns its output lines.
+let redisIn (context: MissionContext) (host: string) (args: string) : string list =
+    let outFile = Path.Combine(Path.GetTempPath(), helmReleaseName + "-redis.txt")
+    let sh = sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" %s" args
+    let cmd = [| "sh"; "-c"; sh |]
+
+    RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+        context.kube,
+        context.namespaceProperty,
+        host,
+        "stellar-core",
+        cmd,
+        outFile
+    )
+
+    File.ReadAllLines outFile
+    |> Array.toList
+    |> List.filter (fun l -> l.Trim() <> "")
 
 // Cleanup on exit. `signalTriggered` indicates we're running under a hard
 // deadline (Jenkins' SoftKillWaitSeconds, ~5s by default, before SIGKILL).
@@ -313,7 +346,7 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
             try
                 LogInfo "Attempting to collect worker logs before cleanup..."
                 let stopwatch = Stopwatch.StartNew()
-                collectLogsFromPods context
+                collectLogsFromPods context (List.ofSeq livePods) |> ignore
                 stopwatch.Stop()
                 LogInfo "Log collection completed in %.2f seconds" stopwatch.Elapsed.TotalSeconds
             with ex -> LogWarn "Failed to collect some or all worker logs: %s" ex.Message
@@ -395,6 +428,12 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
     installProject context
 
     let mutable allJobsFinished = false
+
+    livePods <-
+        Set.ofList [ for i in 0 .. context.pubnetParallelCatchupNumWorkers - 1 ->
+                         sprintf "%s-stellar-core-%d-0" helmReleaseName i ]
+    // Marks from earlier passes only, so nothing is removed in the pass that marked it.
+    let mutable marked : Set<string> = Set.empty
     let mutable timeoutLeft = jobMonitorStatusCheckTimeOutSecs
     let mutable timeBeforeNextMetricsCheck = jobMonitorMetricsCheckIntervalSecs
     let jobMonitorPath = "/" + context.namespaceProperty + "/" + helmReleaseName
@@ -423,6 +462,48 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                         LogInfo "<<<"
 
                     failwith "Catch up failed, check logs for more info"
+
+                // `queue_remain_count`, not `num_remain`, which is 1 as a pre-first-poll sentinel.
+                let outstanding = status.Value<int>("queue_remain_count") + JobsInProgress.Count
+
+                try
+                    let ready = readyPods context
+                    // Read job_owners directly so it is current, not as old as the status snapshot.
+                    let busy = redisIn context (Seq.head ready) "HVALS job_owners" |> Set.ofList
+                    let removable = marked |> Set.filter (fun p -> ready.Contains p && not (busy.Contains p))
+
+                    if not removable.IsEmpty then
+                        // /data is emptyDir, so a pod removed before its logs are read loses them.
+                        match collectLogsFromPods context (List.ofSeq removable) with
+                        | [] ->
+                            for pod in removable do
+                                let sts = pod.Substring(0, pod.Length - 2)
+
+                                context.kube.DeleteNamespacedStatefulSet(sts, context.namespaceProperty)
+                                |> ignore
+
+                            marked <- Set.difference marked removable
+                            livePods <- Set.difference livePods removable
+                            LogInfo "Retired %d workers (%d outstanding)" removable.Count outstanding
+                        | failed -> LogWarn "Not retiring: log collection failed for %d workers" failed.Length
+
+                    let toMark =
+                        ready
+                        |> Seq.filter (fun p -> not (busy.Contains p) && not (marked.Contains p))
+                        |> Seq.truncate (max 0 (ready.Count - outstanding))
+                        |> List.ofSeq
+
+                    // Chunked because RunRemoteCommand rejects a command of 4096 bytes or more.
+                    for chunk in List.chunkBySize 30 toMark do
+                        let names = chunk |> List.map (sprintf "'%s'") |> String.concat " "
+
+                        redisIn context (Seq.head ready) (sprintf "SADD \"%s-retiring\" %s" helmReleaseName names)
+                        |> ignore
+
+                    if not toMark.IsEmpty then
+                        marked <- Set.union marked (Set.ofList toMark)
+                        LogInfo "Marked %d retiring (%d ready, %d outstanding)" toMark.Length ready.Count outstanding
+                with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 
                 if remainSize = 0 && JobsInProgress.Count = 0 then
                     // All jobs completed — perform a final query on the metrics

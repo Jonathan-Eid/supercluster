@@ -22,6 +22,13 @@ SLEEP_INTERVAL=10
 LOG_DIR="/data"
 
 while true; do
+# Stop claiming once the driver marks us, so it can remove us without interrupting a range.
+if [ "$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" SISMEMBER "$RELEASE_NAME-retiring" "$POD_NAME")" = "1" ]; then
+    echo "$(date) $POD_NAME is retiring; not claiming."
+    sleep $SLEEP_INTERVAL
+    continue
+fi
+
 # Fetch the next job key from the Redis queue.
 # Our ranges are generated in the order we want to run them from left to right, so we always pull from the left
 JOB_KEY=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" LMOVE "$JOB_QUEUE" "$PROGRESS_QUEUE" LEFT LEFT)
