@@ -223,10 +223,15 @@ let installProject (context: MissionContext) =
     let expandedKubeCfg = ExpandHomeDirTilde context.kubeCfg
     Environment.SetEnvironmentVariable("KUBECONFIG", expandedKubeCfg)
 
+    // --namespace is not optional: without it helm uses the kubeconfig's current
+    // namespace while every other call honours context.namespaceProperty, so a run
+    // targeted at one namespace installs its chart into another.
     RunShellCommand [| "helm"
                        "install"
                        helmReleaseName
                        helmChartPath
+                       "--namespace"
+                       context.namespaceProperty
                        "--values"
                        valuesFilePath
                        "--set"
@@ -236,7 +241,9 @@ let installProject (context: MissionContext) =
     match RunShellCommand [| "helm"
                              "get"
                              "values"
-                             helmReleaseName |] with
+                             helmReleaseName
+                             "--namespace"
+                             context.namespaceProperty |] with
     | Some valuesOutput -> LogInfo "%s" valuesOutput
     | _ -> ()
 
@@ -341,7 +348,9 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "--namespace"
+                               context.namespaceProperty |]
             |> ignore
         else
             // Normal / legitimate-failure path: pods are still alive through
@@ -358,7 +367,9 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "--namespace"
+                               context.namespaceProperty |]
             |> ignore
 
 let mutable cleanupContext : MissionContext option = None
