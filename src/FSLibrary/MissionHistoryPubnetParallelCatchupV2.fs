@@ -296,24 +296,27 @@ let readyPods (context: MissionContext) : Set<string> =
     |> Seq.map (fun pod -> pod.Metadata.Name)
     |> Set.ofSeq
 
-// Runs redis-cli in a ready worker and returns its output lines.
-let redisIn (context: MissionContext) (host: string) (args: string) : string list =
-    let outFile = Path.Combine(Path.GetTempPath(), helmReleaseName + "-redis.txt")
-    let sh = sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" %s" args
-    let cmd = [| "sh"; "-c"; sh |]
+// Runs redis-cli in a ready worker and returns its output lines, or none if there is no host.
+let redisIn (context: MissionContext) (ready: Set<string>) (args: string) : string list =
+    match Seq.tryHead ready with
+    | None -> []
+    | Some host ->
+        let outFile = Path.Combine(Path.GetTempPath(), helmReleaseName + "-redis.txt")
+        let sh = sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" %s" args
+        let cmd = [| "sh"; "-c"; sh |]
 
-    RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
-        context.kube,
-        context.namespaceProperty,
-        host,
-        "stellar-core",
-        cmd,
-        outFile
-    )
+        RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+            context.kube,
+            context.namespaceProperty,
+            host,
+            "stellar-core",
+            cmd,
+            outFile
+        )
 
-    File.ReadAllLines outFile
-    |> Array.toList
-    |> List.filter (fun l -> l.Trim() <> "")
+        File.ReadAllLines outFile
+        |> Array.toList
+        |> List.filter (fun l -> l.Trim() <> "")
 
 // Cleanup on exit. `signalTriggered` indicates we're running under a hard
 // deadline (Jenkins' SoftKillWaitSeconds, ~5s by default, before SIGKILL).
@@ -467,9 +470,12 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                 let outstanding = status.Value<int>("queue_remain_count") + JobsInProgress.Count
 
                 try
-                    let mutable ready = readyPods context
+                    // Each read costs an apiserver call or a pod exec, so skip both when nothing is marked and the queue still outruns the fleet.
+                    let doReads = not marked.IsEmpty || outstanding < livePods.Count
+                    let mutable ready = if doReads then readyPods context else Set.empty
                     // Read job_owners directly so it is current, not as old as the status snapshot.
-                    let busy = redisIn context (Seq.head ready) "HVALS job_owners" |> Set.ofList
+                    let busy = redisIn context ready "HVALS job_owners" |> Set.ofList
+
                     let removable = marked |> Set.filter (fun p -> ready.Contains p && not (busy.Contains p))
 
                     if not removable.IsEmpty then
@@ -498,7 +504,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                     for chunk in List.chunkBySize 30 toMark do
                         let names = chunk |> List.map (sprintf "'%s'") |> String.concat " "
 
-                        redisIn context (Seq.head ready) (sprintf "SADD \"%s-retiring\" %s" helmReleaseName names)
+                        redisIn context ready (sprintf "SADD \"%s-retiring\" %s" helmReleaseName names)
                         |> ignore
 
                     if not toMark.IsEmpty then
