@@ -49,6 +49,8 @@ let mutable nonce : String = ""
 let mutable helmReleaseName : String = ""
 // Pods not yet retired; module scope because cleanup runs from a signal handler.
 let mutable livePods : Set<string> = Set.empty
+// Log collection is serial and runs inside the poll loop, so bound what one pass can block on.
+let maxRetiredPerPass = 32
 
 let jobMonitorHostName (context: MissionContext) =
     match context.jobMonitorExternalHost with
@@ -476,7 +478,8 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                     // Read job_owners directly so it is current, not as old as the status snapshot.
                     let busy = redisIn context ready "HVALS job_owners" |> Set.ofList
 
-                    let removable = marked |> Set.filter (fun p -> ready.Contains p && not (busy.Contains p))
+                    let idle p = ready.Contains p && not (busy.Contains p)
+                    let removable = marked |> Seq.filter idle |> Seq.truncate maxRetiredPerPass |> Set.ofSeq
 
                     if not removable.IsEmpty then
                         // /data is emptyDir, so a pod removed before its logs are read loses them.
