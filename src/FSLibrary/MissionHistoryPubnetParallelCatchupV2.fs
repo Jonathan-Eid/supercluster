@@ -14,6 +14,7 @@ open StellarSupercluster
 
 open System
 open System.Diagnostics
+open System.Net
 open System.Net.Http
 open System.IO
 
@@ -620,7 +621,16 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                                     // would re-select them and fail collecting from a
                                     // pod that no longer exists.
                                     liveWorkers <- Set.remove index liveWorkers
-                                with ex -> LogWarn "Could not remove worker %d: %s" index ex.Message
+                                with
+                                | :? Microsoft.Rest.HttpOperationException as ex when
+                                    ex.Response.StatusCode = HttpStatusCode.NotFound ->
+                                    // Already gone: nothing to delete, and no logs
+                                    // left to lose. Leaving it in liveWorkers would
+                                    // re-select it every pass and fail collecting
+                                    // from a pod that no longer exists.
+                                    LogInfo "Worker %d was already gone" index
+                                    liveWorkers <- Set.remove index liveWorkers
+                                | ex -> LogWarn "Could not remove worker %d: %s" index ex.Message
 
                             if not failed.IsEmpty then
                                 LogWarn
