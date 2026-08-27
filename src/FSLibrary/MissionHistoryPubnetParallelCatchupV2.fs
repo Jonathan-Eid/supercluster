@@ -52,6 +52,9 @@ let mutable livePods : Set<string> = Set.empty
 // Log collection is serial and runs inside the poll loop, so bound what one pass can block on.
 let maxRetiredPerPass = 32
 
+// A job the monitor requeues needs a worker still willing to claim it.
+let minUnmarkedWorkers = 3
+
 let jobMonitorHostName (context: MissionContext) =
     match context.jobMonitorExternalHost with
     | Some host -> host
@@ -508,11 +511,16 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                             LogInfo "Retired %d workers (%d outstanding)" removable.Count outstanding
                         | failed -> LogWarn "Not retiring: log collection failed for %d workers" failed.Length
 
-                    let toMark =
+                    // Counted against unmarked workers, not `ready`: marked pods linger until
+                    // they are deleted, and counting them erodes the reserve to nothing.
+                    let markable =
                         ready
                         |> Seq.filter (fun p -> not (busy.Contains p) && not (marked.Contains p))
-                        |> Seq.truncate (max 0 (ready.Count - outstanding))
                         |> List.ofSeq
+
+                    let toMark =
+                        markable
+                        |> List.truncate (max 0 (markable.Length - max outstanding minUnmarkedWorkers))
 
                     // Chunked because RunRemoteCommand rejects a command of 4096 bytes or more.
                     for chunk in List.chunkBySize 30 toMark do
