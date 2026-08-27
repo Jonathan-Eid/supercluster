@@ -493,7 +493,7 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                     let doReads = not marked.IsEmpty || outstanding < livePods.Count
                     let mutable ready = if doReads then readyPods context else Set.empty
                     // Read job_owners directly so it is current, not as old as the status snapshot.
-                    let busy = redisIn context ready "HVALS job_owners" |> Set.ofList
+                    let busy = redisIn context ready "HVALS \"$JOB_OWNERS\"" |> Set.ofList
 
                     let idle p = ready.Contains p && not (busy.Contains p)
                     let removable = marked |> Seq.filter idle |> Seq.truncate maxRetiredPerPass |> Set.ofSeq
