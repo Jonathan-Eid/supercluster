@@ -530,8 +530,9 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                         redisIn context ready (sprintf "SADD \"%s-retiring\" %s" helmReleaseName names)
                         |> ignore
 
+                        marked <- Set.union marked (Set.ofList chunk)
+
                     if not toMark.IsEmpty then
-                        marked <- Set.union marked (Set.ofList toMark)
                         LogInfo "Marked %d retiring (%d ready, %d outstanding)" toMark.Length ready.Count outstanding
                 with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
 

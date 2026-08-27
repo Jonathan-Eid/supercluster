@@ -76,7 +76,7 @@ let private sweepWithCutoff (cutoff: DateTime) (kube: Kubernetes) (ns: string) (
                    |> Seq.filter (fun sts -> isOlderThan cutoff sts.Metadata)
                    |> Seq.map (fun sts -> sts.Metadata.Name)
                    |> Seq.filter (fun name -> name.StartsWith("parallel-catchup-") && name.Contains("-stellar-core"))
-                   |> Seq.map (fun name -> name.Substring(0, name.IndexOf("-stellar-core")))
+                   |> Seq.map (fun name -> name.Substring(0, name.LastIndexOf("-stellar-core")))
                    |> Set.ofSeq do
         LogInfo "Orphan sweep: helm uninstall %s" release
 
