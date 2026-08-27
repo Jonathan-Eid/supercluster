@@ -22,6 +22,13 @@ SLEEP_INTERVAL=10
 LOG_DIR="/data"
 
 while true; do
+# Stop claiming once the driver marks us, so it can remove us without interrupting a range.
+if [ "$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" SISMEMBER "$RELEASE_NAME-retiring" "$POD_NAME")" = "1" ]; then
+    echo "$(date) $POD_NAME is retiring; not claiming."
+    sleep $SLEEP_INTERVAL
+    continue
+fi
+
 # Fetch the next job key from the Redis queue.
 # Our ranges are generated in the order we want to run them from left to right, so we always pull from the left
 JOB_KEY=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" LMOVE "$JOB_QUEUE" "$PROGRESS_QUEUE" LEFT LEFT)
@@ -77,8 +84,7 @@ if [ $LMOVE_EXIT_CODE -eq 0 ] && [ -n "$JOB_KEY" ]; then
     fi
 
     # Push metrics to redis in a transaction to ensure data consistency. Retry for 5min on failures
-    # Extract the pod ordinal (last hyphen-separated segment) from pod name like "release-name-stellar-core-0"
-    core_id=$(echo "$POD_NAME" | awk -F'-' '{print $NF}')
+    core_id="$WORKER_INDEX"
     # Validate core_id was extracted successfully
     if [ -z "$core_id" ]; then
         echo "Error: Failed to extract core_id from POD_NAME: $POD_NAME"
