@@ -66,14 +66,16 @@ namespace CSLibrary
         }
 
         // Execute a command and capture stdout to a file (for copying files from pod)
-        public static void RunRemoteCommandAndCaptureOutput(Kubernetes kube, string ns, string podName,
+        // Returns the command's exit code; callers that ignore it cannot tell a
+        // failed exec from a command that legitimately produced no output.
+        public static int RunRemoteCommandAndCaptureOutput(Kubernetes kube, string ns, string podName,
             string containerName, string[] command, string outputFilePath)
         {
-            Task task = RunRemoteCommandAndCaptureOutputAsync(kube, ns, podName, containerName, command, outputFilePath);
-            task.Wait();
+            Task<int> task = RunRemoteCommandAndCaptureOutputAsync(kube, ns, podName, containerName, command, outputFilePath);
+            return task.Result;
         }
 
-        public static async Task RunRemoteCommandAndCaptureOutputAsync(Kubernetes kube, string ns, string podName,
+        public static async Task<int> RunRemoteCommandAndCaptureOutputAsync(Kubernetes kube, string ns, string podName,
             string containerName, string[] command, string outputFilePath)
         {
             // The `using` lifetime guard ensure these objects lifetimes last the entire task,
@@ -89,30 +91,28 @@ namespace CSLibrary
                    stderr: true,
                    tty: false).ConfigureAwait(false))
             using (System.IO.Stream stdout = mstr.GetStream(ChannelIndex.StdOut, null))
-            using (System.IO.Stream stderr = mstr.GetStream(ChannelIndex.Error, null))
-            using (System.IO.StreamReader errorReader = new System.IO.StreamReader(stderr))
+            using (System.IO.Stream statusChannel = mstr.GetStream(ChannelIndex.Error, null))
+            using (System.IO.StreamReader statusReader = new System.IO.StreamReader(statusChannel))
             using (System.IO.FileStream fileStream = new System.IO.FileStream(outputFilePath, FileMode.Create, FileAccess.Write, FileShare.None,
         bufferSize: 128 * 1024, useAsync: true))
             {
                 // Start the MuxStream, this establishes the connection and routes bytes back into separate channels.
-                // We only care about stdout(1) and stderr(2). 
+                // We only care about stdout(1) and the status channel(3).
                 mstr.Start();
 
-                // Copy stdout → file asynchronously, and drain stderr concurrently.
+                // Copy stdout → file asynchronously, and drain the status channel concurrently.
                 var copyTask = stdout.CopyToAsync(fileStream);
-                var errorTask = errorReader.ReadToEndAsync();
+                var statusTask = statusReader.ReadToEndAsync();
 
-                await Task.WhenAll(copyTask, errorTask).ConfigureAwait(false);
+                await Task.WhenAll(copyTask, statusTask).ConfigureAwait(false);
 
                 // Flush the file stream to ensure all data is written
                 await fileStream.FlushAsync().ConfigureAwait(false);
 
-                // Log any errors to console
-                string errors = errorTask.Result;
-                if (!string.IsNullOrEmpty(errors))
-                {
-                    Console.WriteLine($"Command stderr from pod {podName}: {errors}");
-                }
+                // Channel 3 is the k8s status channel, not stderr: it carries a
+                // V1Status whose causes hold the command's real exit code.
+                string status = statusTask.Result;
+                return Kubernetes.GetExitCodeOrThrow(SafeJsonConvert.DeserializeObject<V1Status>(status));
             }
         }
     }

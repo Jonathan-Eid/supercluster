@@ -274,14 +274,19 @@ let collectLogsFromPods (context: MissionContext) (podNames: string list) : stri
             let outputFile = Path.Combine(context.destination.Path, sprintf "%s-logs.tar.gz" podName)
 
             // Execute the command and capture the tar output to a local file
-            RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
-                kube = context.kube,
-                ns = context.namespaceProperty,
-                podName = podName,
-                containerName = "stellar-core",
-                command = command,
-                outputFilePath = outputFile
-            )
+            let rc =
+                RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+                    kube = context.kube,
+                    ns = context.namespaceProperty,
+                    podName = podName,
+                    containerName = "stellar-core",
+                    command = command,
+                    outputFilePath = outputFile
+                )
+
+            // tar exiting non-zero raises nothing, so without this a failed
+            // archive counts as collected and the pod is deleted with its logs.
+            if rc <> 0 then failwithf "tar exited %d" rc
 
             let fileInfo = FileInfo(outputFile)
 
@@ -317,14 +322,19 @@ let redisIn (context: MissionContext) (ready: Set<string>) (args: string) : stri
         let sh = sprintf "redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" %s" args
         let cmd = [| "sh"; "-c"; sh |]
 
-        RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
-            context.kube,
-            context.namespaceProperty,
-            host,
-            "stellar-core",
-            cmd,
-            outFile
-        )
+        // A failed exec would otherwise return no lines, which reads as "no worker
+        // is busy" and makes every worker look retirable.
+        let rc =
+            RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+                context.kube,
+                context.namespaceProperty,
+                host,
+                "stellar-core",
+                cmd,
+                outFile
+            )
+
+        if rc <> 0 then failwithf "redis-cli in %s exited %d" host rc
 
         File.ReadAllLines outFile
         |> Array.toList
