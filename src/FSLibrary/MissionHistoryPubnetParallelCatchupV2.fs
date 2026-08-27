@@ -520,14 +520,12 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
 
                     // Counted against unmarked workers, not `ready`: marked pods linger until
                     // they are deleted, and counting them erodes the reserve to nothing.
-                    let markable =
-                        ready
-                        |> Seq.filter (fun p -> not (busy.Contains p) && not (marked.Contains p))
-                        |> List.ofSeq
+                    let unmarked = ready |> Seq.filter (fun p -> not (marked.Contains p)) |> List.ofSeq
 
                     let toMark =
-                        markable
-                        |> List.truncate (max 0 (markable.Length - max outstanding minUnmarkedWorkers))
+                        unmarked
+                        |> List.filter (fun p -> not (busy.Contains p))
+                        |> List.truncate (max 0 (unmarked.Length - max outstanding minUnmarkedWorkers))
 
                     // Chunked because RunRemoteCommand rejects a command of 4096 bytes or more.
                     for chunk in List.chunkBySize 30 toMark do
