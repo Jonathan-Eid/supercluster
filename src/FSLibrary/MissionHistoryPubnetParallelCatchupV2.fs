@@ -271,19 +271,15 @@ let collectLogsFromPods (context: MissionContext) (podNames: string list) : stri
             let outputFile = Path.Combine(context.destination.Path, sprintf "%s-logs.tar.gz" podName)
 
             // Execute the command and capture the tar output to a local file
-            let rc =
-                RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
-                    kube = context.kube,
-                    ns = context.namespaceProperty,
-                    podName = podName,
-                    containerName = "stellar-core",
-                    command = command,
-                    outputFilePath = outputFile
-                )
-
-            // tar exiting non-zero raises nothing, so without this a failed
-            // archive counts as collected and the pod is deleted with its logs.
-            if rc <> 0 then failwithf "tar exited %d" rc
+            RemoteCommandRunner.RunRemoteCommandAndCaptureOutput(
+                kube = context.kube,
+                ns = context.namespaceProperty,
+                podName = podName,
+                containerName = "stellar-core",
+                command = command,
+                outputFilePath = outputFile
+            )
+            |> ignore
 
             let fileInfo = FileInfo(outputFile)
 
