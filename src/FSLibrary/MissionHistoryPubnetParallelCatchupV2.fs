@@ -50,7 +50,7 @@ let mutable helmReleaseName : String = ""
 // Pods not yet retired; module scope because cleanup runs from a signal handler.
 let mutable livePods : Set<string> = Set.empty
 // Log collection is serial and runs inside the poll loop, so bound what one pass can block on.
-let maxRetiredPerPass = 32
+let maxRetiredPerPass = 64
 
 // A job the monitor requeues needs a worker still willing to claim it.
 let minUnmarkedWorkers = 3
@@ -226,9 +226,6 @@ let installProject (context: MissionContext) =
     let expandedKubeCfg = ExpandHomeDirTilde context.kubeCfg
     Environment.SetEnvironmentVariable("KUBECONFIG", expandedKubeCfg)
 
-    // --namespace is not optional: without it helm uses the kubeconfig's current
-    // namespace while every other call honours context.namespaceProperty, so a run
-    // targeted at one namespace installs its chart into another.
     RunShellCommand [| "helm"
                        "install"
                        helmReleaseName

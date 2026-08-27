@@ -66,8 +66,7 @@ namespace CSLibrary
         }
 
         // Execute a command and capture stdout to a file (for copying files from pod)
-        // Returns the command's exit code; callers that ignore it cannot tell a
-        // failed exec from a command that legitimately produced no output.
+        // Returns the command's exit code
         public static int RunRemoteCommandAndCaptureOutput(Kubernetes kube, string ns, string podName,
             string containerName, string[] command, string outputFilePath)
         {
@@ -109,8 +108,6 @@ namespace CSLibrary
                 // Flush the file stream to ensure all data is written
                 await fileStream.FlushAsync().ConfigureAwait(false);
 
-                // Channel 3 is the k8s status channel, not stderr: it carries a
-                // V1Status whose causes hold the command's real exit code.
                 string status = statusTask.Result;
                 return Kubernetes.GetExitCodeOrThrow(SafeJsonConvert.DeserializeObject<V1Status>(status));
             }
