@@ -1,5 +1,6 @@
 import os
 import redis
+import socket
 import requests
 import json
 import sys
@@ -7,6 +8,9 @@ import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+from redis.retry import Retry
 from prometheus_client import Gauge, Counter, Histogram, generate_latest, REGISTRY, CONTENT_TYPE_LATEST
 from datetime import datetime, timezone
 
@@ -17,12 +21,14 @@ from datetime import datetime, timezone
 metric_buckets = (300, 900, 1800, 3600, 5400, 7200, float("inf"))
 REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
 REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
-JOB_QUEUE = os.getenv('JOB_QUEUE', 'ranges')
-SUCCESS_QUEUE = os.getenv('SUCCESS_QUEUE', 'succeeded')
-FAILED_QUEUE = os.getenv('FAILED_QUEUE', 'failed')
-PROGRESS_QUEUE = os.getenv('PROGRESS_QUEUE', 'in_progress')
-METRICS = os.getenv('METRICS', 'metrics')
-JOB_OWNERS = os.getenv('JOB_OWNERS', 'job_owners')
+JOB_QUEUE = os.getenv('JOB_QUEUE', 'ranges') # LIST
+SUCCESS_QUEUE = os.getenv('SUCCESS_QUEUE', 'succeeded') # SET
+FAILED_QUEUE = os.getenv('FAILED_QUEUE', 'failed') # SET
+PROGRESS_QUEUE = os.getenv('PROGRESS_QUEUE', 'in_progress') #LIST
+METRICS = os.getenv('METRICS', 'metrics') # SET
+JOB_OWNERS = os.getenv('JOB_OWNERS', 'job_owners') # HASH
+RETIRING = os.getenv('RETIRING', 'retiring') # SET
+MIN_UNMARKED_WORKERS = int(os.getenv('MIN_UNMARKED_WORKERS', 8))
 WORKER_PREFIX = os.getenv('WORKER_PREFIX', 'stellar-core')
 NAMESPACE = os.getenv('NAMESPACE', 'default')
 WORKER_COUNT = int(os.getenv('WORKER_COUNT', 3))
@@ -44,8 +50,16 @@ def get_logging_level():
     else:
         return logging.INFO
 
-# Initialize Redis client
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
+    health_check_interval=30,
+    retry=Retry(ExponentialBackoff(cap=2, base=0.1), 3),
+    retry_on_error=[RedisConnectionError, RedisTimeoutError],
+)
 
 # Configure logging
 log_file_name = f"job_monitor_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}.log"
@@ -66,6 +80,7 @@ status = {
     'jobs_failed': [],
     'jobs_in_progress': [],
     'workers': [],
+    'retirable': [],
     'workers_up': 0,
     'workers_down': 0,
     'workers_refresh_duration': 0,
@@ -111,6 +126,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+# Move one job from the progress queue back to the job queue and drop its owner.
+def requeue_job(job_key):
+    if redis_client.lrem(PROGRESS_QUEUE, -1, job_key) == 1:
+        redis_client.lpush(JOB_QUEUE, job_key)
+    redis_client.hdel(JOB_OWNERS, job_key)
+
 def retry_jobs_in_progress():
     while redis_client.llen(PROGRESS_QUEUE) > 0:
         job = redis_client.lmove(PROGRESS_QUEUE, JOB_QUEUE, "RIGHT", "LEFT")
@@ -131,6 +152,14 @@ def ping_worker(pod_name, retries=1):
                 time.sleep(STUCK_JOB_PING_DELAY_SECS)
     return False
 
+def pod_exists(pod_name):
+    # Trailing dot skips the resolv.conf search list, so a miss costs one query.
+    try:
+        socket.gethostbyname(f"{pod_name}.{WORKER_PREFIX}.{NAMESPACE}.svc.cluster.local.")
+        return True
+    except socket.gaierror:
+        return False
+
 def update_status_and_metrics():
     global status
     mission_start_time = time.time()
@@ -138,15 +167,46 @@ def update_status_and_metrics():
         try:
             # --- Phase 1: Read queue status from Redis (fast, authoritative) ---
             queue_remain_count = redis_client.llen(JOB_QUEUE)
-            queue_succeeded_count = redis_client.llen(SUCCESS_QUEUE)
-            jobs_failed = redis_client.lrange(FAILED_QUEUE, 0, -1)
+            queue_succeeded_count = redis_client.scard(SUCCESS_QUEUE)
+            jobs_failed = list(redis_client.smembers(FAILED_QUEUE))
             jobs_in_progress = redis_client.lrange(PROGRESS_QUEUE, 0, -1)
+            job_owners = redis_client.hgetall(JOB_OWNERS)  # {job_key: pod_name}
             queue_failed_count = len(jobs_failed)
             queue_in_progress_count = len(jobs_in_progress)
 
+            # --- Phase 1b: Requeue orphaned jobs (in progress, but owned by nobody) ---
+            orphans = [job for job in jobs_in_progress if job not in job_owners]
+            for job in orphans:
+                logger.error("Requeuing orphaned job %s: in %s with no owner in %s",
+                             job, PROGRESS_QUEUE, JOB_OWNERS)
+                requeue_job(job)
+                metric_retries.inc()
+            if orphans:
+                jobs_in_progress = redis_client.lrange(PROGRESS_QUEUE, 0, -1)
+                queue_in_progress_count = len(jobs_in_progress)
+                queue_remain_count = redis_client.llen(JOB_QUEUE)
+
+            # --- Phase 1c: Mark surplus idle workers as retiring; worker.sh stops claiming once marked ---
+            # Names here are pod names ("{WORKER_PREFIX}-{i}") as worker.sh stores them in JOB_OWNERS.
+            busy = set(job_owners.values())
+            retiring = redis_client.smembers(RETIRING)
+            candidates = sorted(w for w in (f"{WORKER_PREFIX}-{i}" for i in range(WORKER_COUNT))
+                                if w not in busy and w not in retiring)
+            outstanding = queue_remain_count + queue_in_progress_count
+            keep = max(outstanding, MIN_UNMARKED_WORKERS)
+            to_mark = []
+            # Resolve only when the name count says something could be marked: at t=0 outstanding >= fleet, so zero lookups.
+            if len(busy - retiring) + len(candidates) > keep:
+                unmarked_idle = [w for w in candidates if pod_exists(w)]
+                to_mark = unmarked_idle[:max(0, len(busy - retiring) + len(unmarked_idle) - keep)]
+            if to_mark:
+                redis_client.sadd(RETIRING, *to_mark)
+                logger.info("Marked %d workers retiring (%d outstanding)", len(to_mark), outstanding)
+            # Marked on an earlier pass and still idle; names stay here after the driver deletes them.
+            retirable = sorted(retiring - busy)
+
             # --- Phase 2: Quick single-ping check of workers that own in-progress jobs ---
-            job_owners = redis_client.hgetall(JOB_OWNERS)  # {job_key: pod_name}
-            active_workers = set(job_owners.values())
+            active_workers = busy
             worker_statuses = []
             workers_up = 0
             workers_down = 0
@@ -202,6 +262,7 @@ def update_status_and_metrics():
                     'jobs_failed': jobs_failed,
                     'jobs_in_progress': jobs_in_progress,
                     'workers': worker_statuses,
+                    'retirable': retirable,
                     'workers_up': workers_up,
                     'workers_down': workers_down,
                     'workers_refresh_duration': workers_refresh_duration,
@@ -224,9 +285,14 @@ def update_status_and_metrics():
                     metrics['metrics'].extend(new_metrics)
                 for timing in new_metrics:
                     # Example: 36024000/8320|213|1.47073e+06ms|2965s
-                    _, _, tx_apply, full_duration = timing.split('|')
-                    metric_full_duration.observe(float(full_duration.rstrip('s')))
-                    metric_tx_apply_duration.observe(float(tx_apply.rstrip('ms'))/1000)
+                    # tx_apply is the literal "N/A" when the worker could not
+                    # read its log file
+                    try:
+                        _, _, tx_apply, full_duration = timing.split('|')
+                        metric_full_duration.observe(float(full_duration.rstrip('s')))
+                        metric_tx_apply_duration.observe(float(tx_apply.rstrip('ms'))/1000)
+                    except (ValueError, TypeError):
+                        logger.warning("Skipping unparseable metric entry: %s", timing)
             logger.info("Metrics: %s", json.dumps(metrics))
 
         except Exception as e:

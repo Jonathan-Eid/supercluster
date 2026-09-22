@@ -41,12 +41,20 @@ let jobMonitorLoggingIntervalSecs = 30 // frequency of job monitor's internal in
 let jobMonitorStatusCheckIntervalSecs = 60 // frequency of us querying job monitor's `/status` end point
 let jobMonitorMetricsCheckIntervalSecs = 60 // frequency of us querying job monitor's `/metrics` end point
 let jobMonitorStatusCheckTimeOutSecs = 600
+// Fail the mission if jobs are claimed but no worker is demonstrably alive, or if the
+// monitor's own status stops advancing
+let jobMonitorStallTimeOutSecs = 1800
+
 let mutable toPerformCleanup = true
 let failedJobLogFileLineCount = 10000
 let failedJobLogStreamLineCount = 1000
 
 let mutable nonce : String = ""
 let mutable helmReleaseName : String = ""
+// Pods not yet retired; module scope because cleanup runs from a signal handler.
+let mutable livePods : Set<string> = Set.empty
+// Log collection is serial and runs inside the poll loop, so bound what one pass can block on.
+let maxRetiredPerPass = 64
 
 let jobMonitorHostName (context: MissionContext) =
     match context.jobMonitorExternalHost with
@@ -223,6 +231,8 @@ let installProject (context: MissionContext) =
                        "install"
                        helmReleaseName
                        helmChartPath
+                       "--namespace"
+                       context.namespaceProperty
                        "--values"
                        valuesFilePath
                        "--set"
@@ -232,22 +242,14 @@ let installProject (context: MissionContext) =
     match RunShellCommand [| "helm"
                              "get"
                              "values"
-                             helmReleaseName |] with
+                             helmReleaseName
+                             "--namespace"
+                             context.namespaceProperty |] with
     | Some valuesOutput -> LogInfo "%s" valuesOutput
     | _ -> ()
 
-// Collect log files from all parallel catchup worker pods
-// This function:
-// 1. Automatically determines worker pod names from context.pubnetParallelCatchupNumWorkers
-// 2. For each pod, finds all files matching "stellar-core-*.log" in /data
-// 3. Creates a tar.gz archive and copies it to context.destination directory
-let collectLogsFromPods (context: MissionContext) =
-    // Generate pod names based on number of workers
-    // Pod names follow the pattern: <helmReleaseName>-stellar-core-0, <helmReleaseName>-stellar-core-1, etc.
-    let podNames =
-        [ 0 .. context.pubnetParallelCatchupNumWorkers - 1 ]
-        |> List.map (fun i -> sprintf "%s-stellar-core-%d" helmReleaseName i)
-
+// Collect log files from the given worker pods; a pod whose collection fails is skipped.
+let collectLogsFromPods (context: MissionContext) (podNames: string list) : unit =
     LogInfo "Collecting logs from %d worker pods to directory: %s" (List.length podNames) context.destination.Path
 
     for podName in podNames do
@@ -271,6 +273,7 @@ let collectLogsFromPods (context: MissionContext) =
                 command = command,
                 outputFilePath = outputFile
             )
+            |> ignore
 
             let fileInfo = FileInfo(outputFile)
 
@@ -303,7 +306,9 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "--namespace"
+                               context.namespaceProperty |]
             |> ignore
         else
             // Normal / legitimate-failure path: pods are still alive through
@@ -313,14 +318,16 @@ let cleanup (signalTriggered: bool) (context: MissionContext) =
             try
                 LogInfo "Attempting to collect worker logs before cleanup..."
                 let stopwatch = Stopwatch.StartNew()
-                collectLogsFromPods context
+                collectLogsFromPods context (List.ofSeq livePods)
                 stopwatch.Stop()
                 LogInfo "Log collection completed in %.2f seconds" stopwatch.Elapsed.TotalSeconds
             with ex -> LogWarn "Failed to collect some or all worker logs: %s" ex.Message
 
             RunShellCommand [| "helm"
                                "uninstall"
-                               helmReleaseName |]
+                               helmReleaseName
+                               "--namespace"
+                               context.namespaceProperty |]
             |> ignore
 
 let mutable cleanupContext : MissionContext option = None
@@ -395,8 +402,16 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
     installProject context
 
     let mutable allJobsFinished = false
+
+    livePods <-
+        Set.ofList [ for i in 0 .. context.pubnetParallelCatchupNumWorkers - 1 ->
+                         sprintf "%s-stellar-core-%d" helmReleaseName i ]
+
     let mutable timeoutLeft = jobMonitorStatusCheckTimeOutSecs
     let mutable timeBeforeNextMetricsCheck = jobMonitorMetricsCheckIntervalSecs
+    let mutable stalledForSecs = 0
+    let mutable monitorStuckForSecs = 0
+    let mutable lastMissionDuration = -1.0
     let jobMonitorPath = "/" + context.namespaceProperty + "/" + helmReleaseName
 
     while not allJobsFinished do
@@ -423,6 +438,75 @@ let historyPubnetParallelCatchupV2 (context: MissionContext) =
                         LogInfo "<<<"
 
                     failwith "Catch up failed, check logs for more info"
+
+                // `queue_remain_count`, not `num_remain`, which is 1 as a pre-first-poll sentinel.
+                let outstanding = status.Value<int>("queue_remain_count") + JobsInProgress.Count
+
+                // The job monitor owns the marking decision; we only collect logs and delete.
+                try
+                    let retirable = status.["retirable"] :?> JArray
+
+                    // Already-deleted names stay in the monitor's set, so filter by what is still live.
+                    let toRetire =
+                        retirable
+                        |> Seq.map (fun name -> name.ToString())
+                        |> Seq.filter livePods.Contains
+                        |> Seq.truncate maxRetiredPerPass
+                        |> List.ofSeq
+
+                    if not toRetire.IsEmpty then
+                        // /data is emptyDir, so collect before deleting or the logs are lost.
+                        collectLogsFromPods context toRetire
+
+                        for pod in toRetire do
+                            try
+                                context.kube.DeleteNamespacedPod(pod, context.namespaceProperty) |> ignore
+                            with :? k8s.Autorest.HttpOperationException as ex when
+                                ex.Response.StatusCode = Net.HttpStatusCode.NotFound ->
+                                LogInfo "Pod %s already gone" pod
+
+                        livePods <- Set.difference livePods (Set.ofList toRetire)
+                        LogInfo "Retired %d workers (%d outstanding)" toRetire.Length outstanding
+                with ex -> LogWarn "Worker scale-down skipped this pass: %s" ex.Message
+                // Detect if the mission is stuck from two signals: 1. job queue
+                // has in progress items but no live workers, which we fail the
+                // mission 2. the job monitor itself gets stuck unable to
+                // updating its internal metrics and status, we treat it as a
+                // warning only
+                let workersUp = status.Value<int>("workers_up")
+                let missionDuration = status.Value<float>("mission_duration")
+                let noLiveWorkers = JobsInProgress.Count > 0 && workersUp = 0
+                let monitorNotAdvancing = missionDuration = lastMissionDuration
+                lastMissionDuration <- missionDuration
+
+                if noLiveWorkers then
+                    stalledForSecs <- stalledForSecs + jobMonitorStatusCheckIntervalSecs
+
+                    if stalledForSecs >= jobMonitorStallTimeOutSecs then
+                        LogError
+                            "Mission stalled for %d seconds: in_progress=%d, workers_up=%d, mission_duration=%f"
+                            stalledForSecs
+                            JobsInProgress.Count
+                            workersUp
+                            missionDuration
+
+                        for job in JobsInProgress do
+                            LogError "Stuck job: %s" (job.ToString())
+
+                        failwith "Catch up stalled, no live workers"
+                else
+                    stalledForSecs <- 0
+
+                if monitorNotAdvancing then
+                    monitorStuckForSecs <- monitorStuckForSecs + jobMonitorStatusCheckIntervalSecs
+
+                    if monitorStuckForSecs >= jobMonitorStallTimeOutSecs then
+                        LogWarn
+                            "Job monitor status has not advanced for %d seconds (mission_duration=%f)"
+                            monitorStuckForSecs
+                            missionDuration
+                else
+                    monitorStuckForSecs <- 0
 
                 if remainSize = 0 && JobsInProgress.Count = 0 then
                     // All jobs completed — perform a final query on the metrics
