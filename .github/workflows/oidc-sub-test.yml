@@ -1,0 +1,46 @@
+name: OIDC sub test (throwaway)
+
+# Proves an ECR policy can authorize pushes by comparing the GitHub OIDC `sub`
+# claim to the ECR repo's Repository tag, with no role chaining or session tags.
+on:
+  push:
+    branches: [ oidc-sub-test ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::932878028796:role/oidc-sub-test
+          aws-region: us-east-1
+          role-session-name: oidc-sub-test-${{ github.run_id }}
+
+      - name: Run expectations
+        run: |
+          set -u
+          REG=932878028796.dkr.ecr.us-east-1.amazonaws.com
+          aws sts get-caller-identity
+          aws ecr get-login-password | docker login -u AWS --password-stdin "$REG"
+          mkdir ctx && echo test > ctx/f && printf 'FROM scratch\nCOPY f /f\n' > ctx/Dockerfile
+          docker build -q -t local/test ctx
+
+          fail=0
+          check(){ # check <expect: allow|deny> <description> <command...>
+            local want=$1 desc=$2; shift 2
+            if "$@" >out.log 2>&1; then got=allow; else got=deny; fi
+            if [ "$got" = "$want" ]; then echo "PASS  $desc (expected $want)"; else echo "FAIL  $desc (expected $want, got $got)"; tail -3 out.log; fail=1; fi
+          }
+          # shellcheck disable=SC2329  # called via check "$@"
+          push(){ docker tag local/test "$REG/$1:t" && docker push "$REG/$1:t"; }
+
+          check allow "push to own repo (any branch)"          push dev/oidc-sub-test-any-own
+          check deny  "push to repo tagged stellar/supercluster" push dev/oidc-sub-test-any-other
+          check deny  "push to main-only repo from test branch" push dev/oidc-sub-test-main-own
+          check allow "create repo claimed for self"           aws ecr create-repository --repository-name dev/oidc-sub-test-new-own   --tags Key=Repository,Value=Jonathan-Eid/supercluster
+          check deny  "create repo claimed for another repo"   aws ecr create-repository --repository-name dev/oidc-sub-test-new-other --tags Key=Repository,Value=stellar/supercluster
+          exit $fail
