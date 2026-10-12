@@ -37,7 +37,7 @@ worker:
     "curl -sf http://history.stellar.org/prd/core-live/core_live_003/{0} -o {1}"
 
 monitor:
-  image: "746476062914.dkr.ecr.us-east-1.amazonaws.com/dev/satyam-test:scaledown-a4f452bd"
+  image: "746476062914.dkr.ecr.us-east-1.amazonaws.com/dev/satyam-test:scaledown-3e5079fd"
   gateway_name: "traefik-gateway-private"
   gateway_namespace: "traefik"
   hostname: "" # to be set by the mission
